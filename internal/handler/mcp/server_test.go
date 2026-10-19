@@ -178,6 +178,13 @@ func TestAllMCPContractsThroughAuthenticatedHTTP(t *testing.T) {
 	if result := call("workspace_get", map[string]any{"workspaceId": "project-a"}); result.IsError {
 		t.Fatalf("workspace_get: %v", result.Content)
 	}
+	if result := call("codex_start_task", map[string]any{
+		"workspaceId": "project-a",
+		"prompt":      "Inspect the disposable fixture.",
+		"sandbox":     "danger-full-access",
+	}); !result.IsError {
+		t.Fatal("codex_start_task accepted caller-supplied sandbox override")
+	}
 	thirdPath := filepath.Join(home, "project-c")
 	if err := os.Mkdir(thirdPath, 0o700); err != nil {
 		t.Fatal(err)
