@@ -5,9 +5,11 @@ Local Go MCP bridge between ChatGPT-compatible clients and Codex App Server on m
 ## Status
 
 - **Implemented:** 15 MCP tools, bearer authentication, explicit/local-approved workspaces, SQLite task and audit storage, async tasks, progress, cancellation, thread resume, and a fixed Codex App Server JSONL client.
-- **Tested in this gate:** 47 Go tests, authenticated MCP contract, bearer rejection on MCP discovery and health, tool annotations, response-size rejection, race detector, vet, and build.
-- **Previously reported, not rerun in this gate:** real MCP → Go bridge → Codex App Server → result flow on a harmless fixture; the prior report says a new thread was denied a sibling read and workspace write.
-- **Not tested in this gate:** real Codex E2E, resumed-thread sandbox behavior, Secure MCP Tunnel runtime/header forwarding, ChatGPT Web connector, ChatGPT account eligibility, launchd, or use from a phone.
+- **Tested locally:** 52 Go tests, race detector, vet, build, authenticated MCP initialization and `tools/list`, and 401 rejection for unauthenticated/invalid-token GET and POST requests.
+- **Sandbox gate:** new, same-process resume, and post-restart turns passed through the real Codex App Server using a deterministic local provider stub. The stub is not a real-model behavior test.
+- **Gate B local prep:** official `tunnel-client` 0.0.16 installed for macOS arm64; a protected profile and token files live outside the repository. A disposable fixture workspace is locally approved.
+- **Not verified:** Platform organization/workspace, existing tunnel resources, tunnel roles, runtime API key, `doctor`, tunnel readiness/polling, or ChatGPT Web. Platform settings returned 403 in this session; no tunnel or key was created.
+- **Not activated:** tunnel-client runtime, ChatGPT connector, launchd, public listener, workspace writes, or privileged operations.
 - **Unsupported:** workspace writes, arbitrary shell/RPC, external/production privileged actions, arbitrary existing CLI session adoption.
 
 See [migration results](docs/MIGRATION.md), [architecture](docs/ARCHITECTURE.md), and [security](docs/SECURITY.md).
@@ -77,7 +79,7 @@ Call `codex_start_task` to get a `taskId`; poll task/progress; read result or ch
 
 ## ChatGPT integration
 
-Not connected. The bridge has no public listener. The official tunnel-client documentation confirms that connector-forwarded `Authorization` overrides static MCP headers; the planned setup therefore uses ChatGPT **No authentication** plus local static bearer injection for both runtime and discovery. This header path and account/workspace eligibility have not been tested. See the sanitized [ChatGPT integration runbook](docs/CHATGPT_INTEGRATION.md); final setup requires local account actions and explicit authorization.
+Not connected. The bridge has no public listener. `tunnel-client` is installed, but no Platform tunnel or runtime key is configured. The prepared profile injects the bridge bearer from a protected local file for both MCP requests and discovery. Connector-forwarded `Authorization` overrides static headers; no-auth connector forwarding remains unverified. See the [ChatGPT integration runbook](docs/CHATGPT_INTEGRATION.md). No connector was created.
 
 ## Data and rollback
 

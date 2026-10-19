@@ -16,7 +16,7 @@ Codex receives task text and can read source inside an approved workspace. Treat
 - **Operations:** bounded prompt/body/output/progress sizes; each MCP tool result is capped at 1 MiB, request bodies at 64 KiB, prompts at 20 KiB, task output/diffs at 64 KiB, and progress at 100 bounded events; one active worker and a queue of 20; task cancellation and shutdown propagation; restart marks active work interrupted and never replays it.
 - **Approvals:** remote callers may request workspace registration and inspect approval metadata. Only the local admin CLI can approve registrations or operation metadata. No privileged executor is connected.
 
-The baseline reports a real local E2E run on Codex App Server `0.163.0`: it read a random marker from an approved fixture, attempted the sibling file and received `Operation not permitted`, and attempted a workspace write that also received `Operation not permitted`. The test covers a new thread and was not rerun in this readiness gate. The adapter sends the same fixed profile to `thread/resume`, but resumed-thread enforcement has not been independently verified by a real App Server E2E test.
+The local sandbox gate passed on Codex App Server `0.163.0`: new-thread, same-process resume, and post-restart resume each ran a syscall probe under the effective read-only policy. The probe read its approved fixture and received OS `EPERM` for sibling reads and workspace writes; fixture hashes stayed unchanged. A deterministic local provider stub supplied the tool call, so this proves the App Server/bridge/sandbox execution path, not real-model tool-selection behavior.
 
 ## Limits and residual risk
 
@@ -28,7 +28,8 @@ The baseline reports a real local E2E run on Codex App Server `0.163.0`: it read
 - Secret redaction is heuristic and not a security boundary. Do not put credentials in prompts. MCP output, SQLite results, progress, diffs, and approval parameters may contain project information.
 - SQLite is plaintext. Protect and back up `BRIDGE_DATA_DIR` accordingly. Expiry removes task output but preserves task metadata and audit rows.
 - Anyone with the bearer token can access every approved workspace while the bridge is available. Keep the listener on loopback and the token local.
-- Secure MCP Tunnel docs state connector-forwarded headers override static `Authorization` headers, and separate static headers can cover discovery and runtime calls. The planned ChatGPT setting is No authentication plus local static bearer injection. This precedence and design are documented, but actual ChatGPT forwarding, account eligibility, and ChatGPT Web are not tested or configured. The tunnel must not be treated as a replacement for bridge auth.
+- The Gate B bridge token is distinct from the tunnel control-plane runtime key. The prepared profile references a mode-0600 file containing the complete `Bearer <token>` header for both `mcp.extra_headers` and `mcp.discovery_extra_headers`; the runtime key uses a separate file reference. No secret value is stored in this repository.
+- Secure MCP Tunnel documentation says connector-forwarded `Authorization` overrides static MCP headers, including for discovery. The future connector must use No authentication if static bearer injection is to work. This precedence is documented, but ChatGPT's no-auth forwarding behavior remains untested. Account roles, tunnel association, and remote readiness are also unverified; the tunnel must not be treated as a replacement for bridge auth.
 - No workspace write, production operation, cloud action, privileged runner, launchd service, or public listener is enabled.
 
 ## Workspace rules
