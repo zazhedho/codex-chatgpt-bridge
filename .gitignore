@@ -1,0 +1,14 @@
+node_modules/
+dist/
+data/
+.env
+.env.*
+!.env.example
+*.log
+/bridge
+/bridge-admin
+*.test
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+bin/
