@@ -96,6 +96,7 @@ func TestRealCodexThroughMCPAndSandbox(t *testing.T) {
 	}
 
 	dataDir := filepath.Join(base, "bridge-data")
+	probeBinary := buildSandboxProbe(t, base)
 	harness := newBridgeHarness(t, home, dataDir)
 	var session *sdk.ClientSession
 	t.Cleanup(func() {
@@ -143,11 +144,12 @@ func TestRealCodexThroughMCPAndSandbox(t *testing.T) {
 
 	before := fixtureSnapshot(t, home)
 	newProbe := filepath.Join(workspaceA, "write-probe-new.txt")
+	newInvocation := fixtureMarker(t, "INVOCATION_NEW_THREAD_")
 	first := runTask(t, ctx, session, "codex_start_task", map[string]any{
 		"workspaceId": "workspace-a",
-		"prompt":      sandboxPrompt(workspaceA, outsidePath, newProbe),
+		"prompt":      sandboxPrompt(probeBinary, workspaceA, outsidePath, newProbe, newInvocation),
 	})
-	newThreadPassed := assertSandboxTurn(t, "new thread", first, insideMarker, outsideMarker, filepath.Join(workspaceA, "marker.txt"), outsidePath, newProbe, home, before)
+	newThreadPassed := assertSandboxTurn(t, "new thread", first, insideMarker, outsideMarker, filepath.Join(workspaceA, "marker.txt"), outsidePath, newProbe, newInvocation, home, before)
 	if first.ThreadID == "" {
 		t.Fatal("completed bridge task did not persist its thread ID")
 	}
@@ -175,10 +177,11 @@ func TestRealCodexThroughMCPAndSandbox(t *testing.T) {
 	}
 
 	resumeProbe := filepath.Join(workspaceA, "write-probe-resume.txt")
+	resumeInvocation := fixtureMarker(t, "INVOCATION_SAME_PROCESS_RESUME_")
 	second := runTask(t, ctx, session, "codex_resume_thread", map[string]any{
-		"workspaceId": "workspace-a", "threadId": first.ThreadID, "prompt": sandboxPrompt(workspaceA, outsidePath, resumeProbe),
+		"workspaceId": "workspace-a", "threadId": first.ThreadID, "prompt": sandboxPrompt(probeBinary, workspaceA, outsidePath, resumeProbe, resumeInvocation),
 	})
-	resumePassed := assertSandboxTurn(t, "resumed thread", second, insideMarker, outsideMarker, filepath.Join(workspaceA, "marker.txt"), outsidePath, resumeProbe, home, before)
+	resumePassed := assertSandboxTurn(t, "resumed thread", second, insideMarker, outsideMarker, filepath.Join(workspaceA, "marker.txt"), outsidePath, resumeProbe, resumeInvocation, home, before)
 	if resumePassed {
 		t.Log("same-process-resume: PASS; effective profile and read-only/network policy confirmed by App Server response and runtime probes")
 	} else {
@@ -196,10 +199,11 @@ func TestRealCodexThroughMCPAndSandbox(t *testing.T) {
 	harness = newBridgeHarness(t, home, dataDir)
 	session = harness.connect(t, ctx)
 	restartProbe := filepath.Join(workspaceA, "write-probe-restart.txt")
+	restartInvocation := fixtureMarker(t, "INVOCATION_POST_RESTART_RESUME_")
 	third := runTask(t, ctx, session, "codex_resume_thread", map[string]any{
-		"workspaceId": "workspace-a", "threadId": first.ThreadID, "prompt": sandboxPrompt(workspaceA, outsidePath, restartProbe),
+		"workspaceId": "workspace-a", "threadId": first.ThreadID, "prompt": sandboxPrompt(probeBinary, workspaceA, outsidePath, restartProbe, restartInvocation),
 	})
-	restartPassed := assertSandboxTurn(t, "post-restart resumed thread", third, insideMarker, outsideMarker, filepath.Join(workspaceA, "marker.txt"), outsidePath, restartProbe, home, before)
+	restartPassed := assertSandboxTurn(t, "post-restart resumed thread", third, insideMarker, outsideMarker, filepath.Join(workspaceA, "marker.txt"), outsidePath, restartProbe, restartInvocation, home, before)
 	if restartPassed {
 		t.Log("post-restart-resume: PASS; SQLite thread ownership survived restart; App Server effective profile and runtime denials confirmed")
 	} else {
@@ -375,23 +379,24 @@ completed:
 	return taskEvidence{ID: taskID, ThreadID: threadID, Result: resultText, Progress: progress.String(), CommandOutputs: commandOutputs, RawResponseTypes: rawResponseTypes, ShellCallCount: shellCallCount, EventCount: len(events), TaskStatus: fmt.Sprint(task["status"])}
 }
 
-func assertSandboxTurn(t *testing.T, label string, result taskEvidence, insideMarker, outsideMarker, insidePath, siblingPath, writePath, fixtureRoot string, before map[string]string) bool {
+func assertSandboxTurn(t *testing.T, label string, result taskEvidence, insideMarker, outsideMarker, insidePath, siblingPath, writePath, invocationMarker, fixtureRoot string, before map[string]string) bool {
 	t.Helper()
-	insideCommandRead := result.ShellCallCount > 0 && containsOutput(result.CommandOutputs, insideMarker)
-	outsideDenied := hasDeniedCommandOutput(result.CommandOutputs, "cat:", siblingPath)
-	writeDenied := hasDeniedCommandOutput(result.CommandOutputs, "touch:", writePath)
-	insideRead := insideCommandRead && strings.Contains(result.Result, insideMarker)
+	invocationSeen := containsOutput(result.CommandOutputs, invocationMarker)
+	insideCommandRead := containsOutput(result.CommandOutputs, "allowed_read=ok value="+insideMarker)
+	outsideDenied := containsOutput(result.CommandOutputs, "sibling_read=denied errno=1")
+	writeDenied := containsOutput(result.CommandOutputs, "workspace_write=denied errno=1")
+	insideRead := insideCommandRead
 	output := result.Result + result.Progress
 	outsideLeaked := strings.Contains(output, outsideMarker)
 	for _, commandOutput := range result.CommandOutputs {
 		outsideLeaked = outsideLeaked || strings.Contains(commandOutput, outsideMarker)
 	}
 	unchanged := reflect.DeepEqual(before, fixtureSnapshot(t, fixtureRoot))
-	if !insideRead || !insideCommandRead || outsideLeaked || !outsideDenied || !writeDenied || !unchanged {
+	if !invocationSeen || !insideRead || outsideLeaked || !outsideDenied || !writeDenied || !unchanged {
 		lowerResult := strings.ToLower(result.Result)
 		lowerProgress := strings.ToLower(result.Progress)
 		summary := redactFixtureText(result.Result, insideMarker, outsideMarker, fixtureRoot, insidePath, siblingPath, writePath)
-		t.Errorf("%s sandbox evidence incomplete or failed: status=%s inside_read=%t inside_command_read=%t sibling_denied=%t write_denied=%t outside_leaked=%t fixture_unchanged=%t shell_call_count=%d raw_response_types=%s command_output_count=%d result_bytes=%d progress_bytes=%d progress_events=%d marker_name_mentioned=%t denial_word_seen=%t refusal_word_seen=%t tool_word_seen=%t approval_word_seen=%t sanitized_result=%q", label, result.TaskStatus, insideRead, insideCommandRead, outsideDenied, writeDenied, outsideLeaked, unchanged, result.ShellCallCount, strings.Join(result.RawResponseTypes, ","), len(result.CommandOutputs), len(result.Result), len(result.Progress), result.EventCount, strings.Contains(lowerResult, "marker.txt"), strings.Contains(lowerProgress, "denied") || strings.Contains(lowerProgress, "permission") || strings.Contains(lowerProgress, "sandbox"), strings.Contains(lowerResult, "cannot") || strings.Contains(lowerResult, "can't") || strings.Contains(lowerResult, "unable") || strings.Contains(lowerResult, "not allowed"), strings.Contains(lowerResult, "shell") || strings.Contains(lowerResult, "command") || strings.Contains(lowerResult, "tool"), strings.Contains(lowerResult, "approval"), summary)
+		t.Errorf("%s sandbox evidence incomplete or failed: status=%s invocation_seen=%t inside_read=%t sibling_denied=%t write_denied=%t outside_leaked=%t fixture_unchanged=%t command_output_count=%d result_bytes=%d progress_bytes=%d progress_events=%d marker_name_mentioned=%t denial_word_seen=%t refusal_word_seen=%t tool_word_seen=%t approval_word_seen=%t sanitized_result=%q", label, result.TaskStatus, invocationSeen, insideRead, outsideDenied, writeDenied, outsideLeaked, unchanged, len(result.CommandOutputs), len(result.Result), len(result.Progress), result.EventCount, strings.Contains(lowerResult, "marker.txt"), strings.Contains(lowerProgress, "denied") || strings.Contains(lowerProgress, "permission") || strings.Contains(lowerProgress, "sandbox"), strings.Contains(lowerResult, "cannot") || strings.Contains(lowerResult, "can't") || strings.Contains(lowerResult, "unable") || strings.Contains(lowerResult, "not allowed"), strings.Contains(lowerResult, "shell") || strings.Contains(lowerResult, "command") || strings.Contains(lowerResult, "tool"), strings.Contains(lowerResult, "approval"), summary)
 		return false
 	}
 	return true
@@ -400,16 +405,6 @@ func assertSandboxTurn(t *testing.T, label string, result taskEvidence, insideMa
 func containsOutput(outputs []string, value string) bool {
 	for _, output := range outputs {
 		if strings.Contains(output, value) {
-			return true
-		}
-	}
-	return false
-}
-
-func hasDeniedCommandOutput(outputs []string, commandPrefix, path string) bool {
-	for _, output := range outputs {
-		lower := strings.ToLower(output)
-		if strings.Contains(lower, strings.ToLower(commandPrefix)) && strings.Contains(output, path) && hasDeniedProbe(lower) {
 			return true
 		}
 	}
@@ -426,17 +421,22 @@ func redactFixtureText(value string, markers ...string) string {
 	return value
 }
 
-func hasDeniedProbe(progress string) bool {
-	for _, phrase := range []string{"permission denied", "operation not permitted", "read-only file system", "access denied", "not permitted"} {
-		if strings.Contains(progress, phrase) {
-			return true
-		}
+func buildSandboxProbe(t *testing.T, directory string) string {
+	t.Helper()
+	binary := filepath.Join(directory, "sandbox-probe")
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	command := exec.CommandContext(ctx, "go", "build", "-o", binary, "./testdata/sandbox_probe.go")
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("build disposable sandbox probe failed (output_bytes=%d)", len(output))
 	}
-	return false
+	return binary
 }
 
-func sandboxPrompt(workspace, sibling, writeProbe string) string {
-	return fmt.Sprintf("The host has already run sonar analyze secrets on the inside and sibling fixture files and confirmed both contain no secrets. Do not run another scan. Use exactly one shell-tool invocation to run this exact shell command, with semicolons preserved: cat %q; cat %q; touch %q. Return only its actual combined stdout and stderr. Do not infer command results, run alternate commands, or change any sandbox, permission, approval, network, or process settings.", filepath.Join(workspace, "marker.txt"), sibling, writeProbe)
+func sandboxPrompt(probeBinary, workspace, sibling, writeProbe, invocationMarker string) string {
+	command := fmt.Sprintf("%q %q %q %q %q", probeBinary, filepath.Join(workspace, "marker.txt"), sibling, writeProbe, invocationMarker)
+	return fmt.Sprintf("The host has already run sonar analyze secrets on the inside and sibling fixture files and confirmed both contain no secrets. Do not run another scan. Use exactly one shell-tool invocation to run this exact shell command: %s. Return only its actual combined stdout and stderr. Do not infer command results, run alternate commands, or change any sandbox, permission, approval, network, or process settings.", command)
 }
 
 func workspaceReadPrompt(workspace string) string {
