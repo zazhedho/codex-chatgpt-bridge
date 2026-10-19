@@ -183,6 +183,8 @@ type CapabilitiesOutput struct {
 
 var taskIDPattern = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$`)
 
+const maxToolResponseBytes = 1 << 20
+
 func NewServer(deps Dependencies) *mcp.Server {
 	logger := deps.Logger
 	if logger == nil {
@@ -368,6 +370,15 @@ func register[In any, Out any](server *mcp.Server, deps Dependencies, name, desc
 			}
 		}
 		output, err := handler(ctx, input)
+		if err == nil {
+			encoded, marshalErr := json.Marshal(output)
+			switch {
+			case marshalErr != nil:
+				err = domain.ErrServiceUnavailable
+			case len(encoded) > maxToolResponseBytes:
+				err = domain.ErrResponseTooLarge
+			}
+		}
 		if err != nil {
 			if deps.Audit != nil {
 				_ = deps.Audit.Record(ctx, audit.Event{Operation: "mcp.tool." + name, Principal: principal, WorkspaceID: workspaceID, TaskID: taskID, Outcome: "failed", ErrorClass: errorClass(err)})
@@ -397,6 +408,8 @@ func toolError(err error) *mcp.CallToolResult {
 		text = "Task queue is full"
 	case errors.Is(err, domain.ErrServiceUnavailable):
 		text = "Bridge service is unavailable"
+	case errors.Is(err, domain.ErrResponseTooLarge):
+		text = "Response exceeds bridge output limit"
 	}
 	return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: text}}, IsError: true}
 }
@@ -415,6 +428,8 @@ func errorClass(err error) string {
 		return "queue_full"
 	case errors.Is(err, domain.ErrServiceUnavailable):
 		return "unavailable"
+	case errors.Is(err, domain.ErrResponseTooLarge):
+		return "response_too_large"
 	default:
 		return "internal"
 	}

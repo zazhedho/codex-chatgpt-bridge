@@ -9,5 +9,6 @@ var (
 	ErrInvalidInput          = errors.New("invalid input")
 	ErrQueueFull             = errors.New("task queue is full")
 	ErrServiceUnavailable    = errors.New("service unavailable")
+	ErrResponseTooLarge      = errors.New("MCP tool response exceeds bridge limit")
 	ErrInvalidTaskTransition = errors.New("invalid task state transition")
 )

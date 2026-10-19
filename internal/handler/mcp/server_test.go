@@ -114,6 +114,25 @@ func TestAllMCPContractsThroughAuthenticatedHTTP(t *testing.T) {
 	if byName["codex_cancel_task"].Annotations == nil || byName["codex_cancel_task"].Annotations.ReadOnlyHint || byName["codex_cancel_task"].Annotations.DestructiveHint == nil || !*byName["codex_cancel_task"].Annotations.DestructiveHint {
 		t.Fatal("codex_cancel_task annotation is unsafe")
 	}
+	readOnlyTools := map[string]bool{
+		"workspace_list": true, "workspace_get": true, "codex_list_threads": true,
+		"codex_get_task": true, "codex_get_progress": true, "codex_get_result": true,
+		"codex_get_changes": true, "approval_list_pending": true, "approval_get_details": true,
+		"bridge_get_status": true, "bridge_get_capabilities": true,
+	}
+	for name, tool := range byName {
+		_, readOnly := readOnlyTools[name]
+		if tool.Annotations == nil || tool.Annotations.ReadOnlyHint != readOnly || tool.Annotations.OpenWorldHint == nil || *tool.Annotations.OpenWorldHint {
+			t.Errorf("%s has incorrect read-only or open-world annotation", name)
+			continue
+		}
+		if !readOnly {
+			wantDestructive := name == "codex_cancel_task"
+			if tool.Annotations.DestructiveHint == nil || *tool.Annotations.DestructiveHint != wantDestructive {
+				t.Errorf("%s has incorrect destructive annotation", name)
+			}
+		}
+	}
 	if byName["codex_start_task"].InputSchema == nil {
 		t.Fatal("codex_start_task has no input schema")
 	}
@@ -209,9 +228,59 @@ func TestAllMCPContractsThroughAuthenticatedHTTP(t *testing.T) {
 	if result := call("bridge_get_capabilities", map[string]any{}); result.IsError {
 		t.Fatalf("bridge_get_capabilities: %v", result.Content)
 	}
+	largeStarted := call("codex_start_task", map[string]any{"workspaceId": "project-a", "prompt": "Return a bounded result."})
+	if largeStarted.IsError {
+		t.Fatalf("start output-limit task: %v", largeStarted.Content)
+	}
+	largeTaskID := structured(largeStarted)["taskId"].(string)
+	if err := store.SetTaskStatus(ctx, largeTaskID, domain.TaskRunning, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.FinishTask(ctx, largeTaskID, domain.TaskSucceeded, strings.Repeat("x", (1<<20)+1), "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if result := call("codex_get_result", map[string]any{"taskId": largeTaskID}); !result.IsError {
+		t.Fatal("MCP returned a result larger than the bridge output limit")
+	}
 	auditRows, err := store.AuditEventCount(ctx)
 	if err != nil || auditRows == 0 {
 		t.Fatalf("audit rows=%d err=%v", auditRows, err)
+	}
+}
+
+func TestNewHTTPHandlerProtectsMCPDiscoveryAndHealth(t *testing.T) {
+	const token = "local-test-token-that-is-long-enough-123456"
+	handler := NewHTTPHandler(Dependencies{Config: config.Config{Host: "127.0.0.1", Port: 8787, AuthToken: token, MaxRequestBytes: 64 << 10}})
+	for _, test := range []struct {
+		name, method, path, body string
+	}{
+		{"MCP initialize", http.MethodPost, "/mcp", `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`},
+		{"MCP tools discovery", http.MethodPost, "/mcp", `{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}`},
+		{"health", http.MethodGet, "/healthz", ""},
+	} {
+		for _, auth := range []struct{ name, value string }{{"missing", ""}, {"invalid", "Bearer invalid-token-value"}} {
+			t.Run(test.name+"/"+auth.name, func(t *testing.T) {
+				req := httptest.NewRequest(test.method, "http://127.0.0.1:8787"+test.path, strings.NewReader(test.body))
+				if auth.value != "" {
+					req.Header.Set("Authorization", auth.value)
+				}
+				rec := httptest.NewRecorder()
+				handler.ServeHTTP(rec, req)
+				if rec.Code != http.StatusUnauthorized {
+					t.Fatalf("%s request to %s returned %d, want 401", auth.name, test.path, rec.Code)
+				}
+				if strings.Contains(rec.Body.String(), token) {
+					t.Fatal("authentication response exposed the bearer token")
+				}
+			})
+		}
+	}
+	request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8787/healthz", nil)
+	request.Header.Set("Authorization", "Bearer "+token)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("authenticated health returned %d, want 200", response.Code)
 	}
 }
 
