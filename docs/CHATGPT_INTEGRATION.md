@@ -1,5 +1,7 @@
 # ChatGPT Integration Readiness
 
+This document records the earlier OpenAI Secure MCP Tunnel attempt and its static-bearer design. The current Cloudflare Access + Managed OAuth path is documented in [CLOUDFLARE_MCP_INTEGRATION.md](CLOUDFLARE_MCP_INTEGRATION.md); the two auth modes are exclusive.
+
 Status as of 2026-10-19: **blocked before Platform setup**. OpenAI Platform settings returned HTTP 403 in this session, and no Platform credentials were available locally. Therefore the intended organization/workspace, existing tunnels, roles, and billing context remain unknown; no tunnel or runtime key was created. No ChatGPT connector or launchd service was created.
 
 The official `tunnel-client` 0.0.16 is installed on macOS arm64 through the OpenAI Homebrew tap. Homebrew verified the official formula SHA-256. The CLI help and `sample_mcp_remote_no_auth` were reviewed. An isolated profile is prepared outside the repository, but it has no tunnel ID or runtime key. Local bridge auth and MCP initialize/tool discovery were tested separately.

@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -48,14 +49,33 @@ type allowTaskExecution struct{}
 func (allowTaskExecution) AuthorizeExecution(context.Context, domain.Workspace) error { return nil }
 
 type bearerTransport struct {
-	base  http.RoundTripper
-	token string
+	base      http.RoundTripper
+	token     string
+	assertion string
+	host      string
 }
 
 func (t bearerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	clone := req.Clone(req.Context())
-	clone.Header.Set("Authorization", "Bearer "+t.token)
+	if t.token != "" {
+		clone.Header.Set("Authorization", "Bearer "+t.token)
+	}
+	if t.assertion != "" {
+		clone.Header.Set("Cf-Access-Jwt-Assertion", t.assertion)
+	}
+	if t.host != "" {
+		clone.Host = t.host
+	}
 	return t.base.RoundTrip(clone)
+}
+
+type accessVerifierStub struct{}
+
+func (accessVerifierStub) Verify(_ context.Context, assertion string) (string, error) {
+	if assertion != "synthetic-access-assertion" {
+		return "", errors.New("invalid assertion")
+	}
+	return "zaqi@example.com", nil
 }
 
 func TestAllMCPContractsThroughAuthenticatedHTTP(t *testing.T) {
@@ -71,20 +91,19 @@ func TestAllMCPContractsThroughAuthenticatedHTTP(t *testing.T) {
 	queue := &queueStub{store: store}
 	tasks := service.NewTaskService(store, store, workspaces, queue, allowTaskExecution{}, logger, 20_000)
 	approvals := service.NewApprovalService(store, workspaces)
-	token := strings.Repeat("t", 48)
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	port := listener.Addr().(*net.TCPAddr).Port
-	cfg := config.Config{Host: "127.0.0.1", Port: port, AuthToken: token, MaxRequestBytes: 64 << 10}
-	handler := NewHTTPHandler(Dependencies{Config: cfg, Workspaces: workspaces, Tasks: tasks, Approvals: approvals, Audit: logger, Codex: codexStatusStub{}, StartedAt: time.Now()})
+	cfg := config.Config{Host: "127.0.0.1", Port: port, AuthMode: config.AuthModeCloudflareAccess, MaxRequestBytes: 64 << 10}
+	handler := NewHTTPHandler(Dependencies{Config: cfg, CloudflareVerifier: accessVerifierStub{}, Workspaces: workspaces, Tasks: tasks, Approvals: approvals, Audit: logger, Codex: codexStatusStub{}, StartedAt: time.Now()})
 	httpServer := &http.Server{Handler: handler}
 	go func() { _ = httpServer.Serve(listener) }()
 	t.Cleanup(func() { _ = httpServer.Close() })
 	endpoint := fmt.Sprintf("http://127.0.0.1:%d/mcp", port)
 	client := sdk.NewClient(&sdk.Implementation{Name: "contract-test", Version: "0.0.0"}, nil)
-	transport := &sdk.StreamableClientTransport{Endpoint: endpoint, HTTPClient: &http.Client{Transport: bearerTransport{base: http.DefaultTransport, token: token}, Timeout: 10 * time.Second}, DisableStandaloneSSE: true, MaxRetries: -1}
+	transport := &sdk.StreamableClientTransport{Endpoint: endpoint, HTTPClient: &http.Client{Transport: bearerTransport{base: http.DefaultTransport, assertion: "synthetic-access-assertion", host: net.JoinHostPort(cfg.Host, fmt.Sprint(cfg.Port))}, Timeout: 10 * time.Second}, DisableStandaloneSSE: true, MaxRetries: -1}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	session, err := client.Connect(ctx, transport, nil)
@@ -340,7 +359,7 @@ func lenOrInvalid(values []any, ok bool) any {
 
 func TestNewHTTPHandlerProtectsMCPDiscoveryAndHealth(t *testing.T) {
 	const token = "local-test-token-that-is-long-enough-123456"
-	handler := NewHTTPHandler(Dependencies{Config: config.Config{Host: "127.0.0.1", Port: 8787, AuthToken: token, MaxRequestBytes: 64 << 10}})
+	handler := NewHTTPHandler(Dependencies{Config: config.Config{Host: "127.0.0.1", Port: 8787, AuthMode: config.AuthModeBearer, AuthToken: token, MaxRequestBytes: 64 << 10}})
 	for _, test := range []struct {
 		name, method, path, body string
 	}{
@@ -371,6 +390,91 @@ func TestNewHTTPHandlerProtectsMCPDiscoveryAndHealth(t *testing.T) {
 	handler.ServeHTTP(response, request)
 	if response.Code != http.StatusOK {
 		t.Fatalf("authenticated health returned %d, want 200", response.Code)
+	}
+}
+
+func TestBearerModeAllowsAuthenticatedMCPToolInvocation(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	token := strings.Repeat("b", 48)
+	handler := NewHTTPHandler(Dependencies{Config: config.Config{Host: "127.0.0.1", Port: port, AuthMode: config.AuthModeBearer, AuthToken: token, MaxRequestBytes: 64 << 10}})
+	server := &http.Server{Handler: handler}
+	go func() { _ = server.Serve(listener) }()
+	t.Cleanup(func() { _ = server.Close() })
+	client := sdk.NewClient(&sdk.Implementation{Name: "bearer-test", Version: "0.0.0"}, nil)
+	transport := &sdk.StreamableClientTransport{Endpoint: fmt.Sprintf("http://127.0.0.1:%d/mcp", port), HTTPClient: &http.Client{Transport: bearerTransport{base: http.DefaultTransport, token: token}, Timeout: 5 * time.Second}, DisableStandaloneSSE: true, MaxRetries: -1}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	session, err := client.Connect(ctx, transport, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	result, err := session.CallTool(ctx, &sdk.CallToolParams{Name: "bridge_get_capabilities", Arguments: map[string]any{}})
+	if err != nil || result.IsError {
+		t.Fatalf("authenticated bearer tool call result=%v err=%v", result, err)
+	}
+}
+
+func TestCloudflareHTTPAuthHasNoBearerFallbackAndRejectsWrongHost(t *testing.T) {
+	handler := NewHTTPHandler(Dependencies{
+		Config:             config.Config{Host: "127.0.0.1", Port: 8787, AuthMode: config.AuthModeCloudflareAccess},
+		CloudflareVerifier: accessVerifierStub{},
+	})
+	for _, request := range []struct {
+		name   string
+		host   string
+		header string
+		want   int
+	}{
+		{name: "missing assertion", host: "127.0.0.1:8787", want: http.StatusUnauthorized},
+		{name: "bearer does not fall back", host: "127.0.0.1:8787", header: "Bearer local-test-token-that-is-long-enough-123456", want: http.StatusUnauthorized},
+		{name: "invalid assertion", host: "127.0.0.1:8787", header: "invalid", want: http.StatusUnauthorized},
+		{name: "wrong host", host: "attacker.example.test", header: "synthetic-access-assertion", want: http.StatusForbidden},
+	} {
+		t.Run(request.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8787/healthz", nil)
+			req.Host = request.host
+			if strings.HasPrefix(request.header, "Bearer ") {
+				req.Header.Set("Authorization", request.header)
+			} else if request.header != "" {
+				req.Header.Set("Cf-Access-Jwt-Assertion", request.header)
+			}
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, req)
+			if response.Code != request.want {
+				t.Fatalf("status=%d, want %d", response.Code, request.want)
+			}
+		})
+	}
+	for _, body := range []string{
+		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`,
+		`{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}`,
+	} {
+		for _, auth := range []string{"", "Bearer local-test-token-that-is-long-enough-123456"} {
+			req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8787/mcp", strings.NewReader(body))
+			req.Host = "127.0.0.1:8787"
+			req.Header.Set("Content-Type", "application/json")
+			if auth != "" {
+				req.Header.Set("Authorization", auth)
+			}
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, req)
+			if response.Code != http.StatusUnauthorized {
+				t.Fatalf("unauthenticated MCP request method=%s status=%d, want 401", body, response.Code)
+			}
+		}
+	}
+
+	withoutVerifier := NewHTTPHandler(Dependencies{Config: config.Config{Host: "127.0.0.1", Port: 8787, AuthMode: config.AuthModeCloudflareAccess}})
+	req := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8787/healthz", nil)
+	response := httptest.NewRecorder()
+	withoutVerifier.ServeHTTP(response, req)
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("missing verifier status=%d, want 503", response.Code)
 	}
 }
 

@@ -243,7 +243,7 @@ func newBridgeHarness(t *testing.T, home, dataDir string) *bridgeHarness {
 		t.Fatal(err)
 	}
 	token := base64.RawURLEncoding.EncodeToString(tokenBytes[:])
-	cfg := config.Config{Host: "127.0.0.1", Port: listener.Addr().(*net.TCPAddr).Port, AuthToken: token, MaxRequestBytes: 64 << 10, MaxOutputBytes: 64 << 10, MaxConcurrentTasks: 1, MaxQueuedTasks: 20, TaskTimeoutSeconds: 180}
+	cfg := config.Config{Host: "127.0.0.1", Port: listener.Addr().(*net.TCPAddr).Port, AuthMode: config.AuthModeBearer, AuthToken: token, MaxRequestBytes: 64 << 10, MaxOutputBytes: 64 << 10, MaxConcurrentTasks: 1, MaxQueuedTasks: 20, TaskTimeoutSeconds: 180}
 	executable := os.Getenv("CODEX_EXECUTABLE")
 	if executable == "" {
 		executable = "codex"

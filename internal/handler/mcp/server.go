@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"net"
 	"net/http"
 	"regexp"
+	"strconv"
 	"time"
 
 	"example.com/codex-chatgpt-bridge/internal/audit"
@@ -20,14 +22,15 @@ import (
 type CodexStatus interface{ Connected() bool }
 
 type Dependencies struct {
-	Config     config.Config
-	Workspaces *service.WorkspaceService
-	Tasks      *service.TaskService
-	Approvals  *service.ApprovalService
-	Audit      *audit.Logger
-	Codex      CodexStatus
-	StartedAt  time.Time
-	Logger     *slog.Logger
+	Config             config.Config
+	Workspaces         *service.WorkspaceService
+	Tasks              *service.TaskService
+	Approvals          *service.ApprovalService
+	Audit              *audit.Logger
+	Codex              CodexStatus
+	CloudflareVerifier security.AccessAssertionVerifier
+	StartedAt          time.Time
+	Logger             *slog.Logger
 }
 
 type Empty struct{}
@@ -363,8 +366,25 @@ func NewHTTPHandler(deps Dependencies) http.Handler {
 	server := NewServer(deps)
 	mcpHandler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return server }, &mcp.StreamableHTTPOptions{JSONResponse: true, SessionTimeout: 30 * time.Minute, MaxRequestBodyBytes: deps.Config.MaxRequestBytes})
 	mux := http.NewServeMux()
-	mux.Handle("/mcp", security.AuthMiddlewareForHost(deps.Config.AuthToken, deps.Config.Host, deps.Config.Port, mcpHandler))
-	mux.Handle("/healthz", security.AuthMiddlewareForHost(deps.Config.AuthToken, deps.Config.Host, deps.Config.Port, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	var authenticate func(http.Handler) http.Handler
+	switch deps.Config.AuthMode {
+	case config.AuthModeBearer:
+		authenticate = func(next http.Handler) http.Handler {
+			return security.AuthMiddlewareForHost(deps.Config.AuthToken, deps.Config.Host, deps.Config.Port, next)
+		}
+	case config.AuthModeCloudflareAccess:
+		authenticate = func(next http.Handler) http.Handler {
+			return security.CloudflareAccessMiddlewareForHost(deps.CloudflareVerifier, net.JoinHostPort(deps.Config.Host, strconv.Itoa(deps.Config.Port)), next)
+		}
+	default:
+		authenticate = func(next http.Handler) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				http.Error(w, "Authentication unavailable", http.StatusServiceUnavailable)
+			})
+		}
+	}
+	mux.Handle("/mcp", authenticate(mcpHandler))
+	mux.Handle("/healthz", authenticate(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"status":"ok"}`))

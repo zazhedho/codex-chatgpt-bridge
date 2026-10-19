@@ -3,6 +3,7 @@ module example.com/codex-chatgpt-bridge
 go 1.27.0
 
 require (
+	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/modelcontextprotocol/go-sdk v1.8.0
 	modernc.org/sqlite v1.60.1
 )
