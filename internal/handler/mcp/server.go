@@ -31,6 +31,22 @@ type Dependencies struct {
 }
 
 type Empty struct{}
+type PageInput struct {
+	Limit  *int `json:"limit,omitempty" jsonschema:"Optional page size from 1 to 10; defaults to 10"`
+	Offset *int `json:"offset,omitempty" jsonschema:"Optional stable offset; defaults to 0"`
+}
+
+func (in PageInput) values() (int, int) {
+	limit, offset := 0, 0
+	if in.Limit != nil {
+		limit = *in.Limit
+	}
+	if in.Offset != nil {
+		offset = *in.Offset
+	}
+	return limit, offset
+}
+
 type WorkspaceIDInput struct {
 	WorkspaceID string `json:"workspaceId" jsonschema:"Registered workspace ID"`
 }
@@ -73,6 +89,7 @@ type SandboxPermissionsDTO struct {
 }
 type WorkspaceListOutput struct {
 	Workspaces []WorkspaceDTO `json:"workspaces"`
+	NextOffset *int           `json:"nextOffset,omitempty"`
 }
 type WorkspaceOutput struct {
 	Workspace WorkspaceDTO `json:"workspace"`
@@ -156,8 +173,10 @@ type OperationApprovalDTO struct {
 	ExpiresAt      int64                 `json:"expiresAt"`
 }
 type ApprovalListOutput struct {
-	WorkspaceRegistrations []RegistrationApprovalDTO `json:"workspaceRegistrations"`
-	OperationApprovals     []OperationApprovalDTO    `json:"operationApprovals"`
+	WorkspaceRegistrations           []RegistrationApprovalDTO `json:"workspaceRegistrations"`
+	WorkspaceRegistrationsNextOffset *int                      `json:"workspaceRegistrationsNextOffset,omitempty"`
+	OperationApprovals               []OperationApprovalDTO    `json:"operationApprovals"`
+	OperationApprovalsNextOffset     *int                      `json:"operationApprovalsNextOffset,omitempty"`
 }
 type ApprovalDetailsOutput struct {
 	Details map[string]any `json:"details"`
@@ -192,12 +211,13 @@ func NewServer(deps Dependencies) *mcp.Server {
 	}
 	server := mcp.NewServer(&mcp.Implementation{Name: "codex-chatgpt-bridge", Title: "Codex ChatGPT Bridge", Version: "0.2.0"}, &mcp.ServerOptions{Logger: logger, KeepAlive: 30 * time.Second})
 
-	register(server, deps, "workspace_list", "List explicitly registered workspaces.", true, false, true, func(ctx context.Context, _ Empty) (WorkspaceListOutput, error) {
-		values, err := deps.Workspaces.List(ctx)
+	register(server, deps, "workspace_list", "List approved workspaces using stable offset pages of up to 10 entries. Omitted limit defaults to 10; use nextOffset to continue.", true, false, true, func(ctx context.Context, in PageInput) (WorkspaceListOutput, error) {
+		limit, offset := in.values()
+		values, nextOffset, err := deps.Workspaces.ListPage(ctx, limit, offset)
 		if err != nil {
 			return WorkspaceListOutput{}, err
 		}
-		out := WorkspaceListOutput{Workspaces: make([]WorkspaceDTO, 0, len(values))}
+		out := WorkspaceListOutput{Workspaces: make([]WorkspaceDTO, 0, len(values)), NextOffset: nextOffset}
 		for _, item := range values {
 			out.Workspaces = append(out.Workspaces, workspaceDTO(item))
 		}
@@ -292,12 +312,13 @@ func NewServer(deps Dependencies) *mcp.Server {
 		task, err := deps.Tasks.Cancel(ctx, in.TaskID)
 		return CancelOutput{TaskID: task.ID, Status: task.Status}, err
 	})
-	register(server, deps, "approval_list_pending", "List pending workspace registration and operation approval details. Approvals remain local.", true, false, true, func(ctx context.Context, _ Empty) (ApprovalListOutput, error) {
-		requests, approvals, err := deps.Approvals.ListPending(ctx)
+	register(server, deps, "approval_list_pending", "List pending workspace registrations and operation approvals with separate nextOffset values. Each list returns up to 10 entries; approvals remain local.", true, false, true, func(ctx context.Context, in PageInput) (ApprovalListOutput, error) {
+		limit, offset := in.values()
+		requests, requestsNext, approvals, approvalsNext, err := deps.Approvals.ListPendingPage(ctx, limit, offset)
 		if err != nil {
 			return ApprovalListOutput{}, err
 		}
-		out := ApprovalListOutput{WorkspaceRegistrations: make([]RegistrationApprovalDTO, 0, len(requests)), OperationApprovals: make([]OperationApprovalDTO, 0, len(approvals))}
+		out := ApprovalListOutput{WorkspaceRegistrations: make([]RegistrationApprovalDTO, 0, len(requests)), WorkspaceRegistrationsNextOffset: requestsNext, OperationApprovals: make([]OperationApprovalDTO, 0, len(approvals)), OperationApprovalsNextOffset: approvalsNext}
 		for _, request := range requests {
 			out.WorkspaceRegistrations = append(out.WorkspaceRegistrations, RegistrationApprovalDTO{RequestID: request.ID, WorkspaceID: request.WorkspaceID, RootPath: request.RootPath, ExpiresAt: request.ExpiresAt.UnixMilli()})
 		}

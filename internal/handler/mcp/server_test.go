@@ -178,6 +178,39 @@ func TestAllMCPContractsThroughAuthenticatedHTTP(t *testing.T) {
 	if result := call("workspace_get", map[string]any{"workspaceId": "project-a"}); result.IsError {
 		t.Fatalf("workspace_get: %v", result.Content)
 	}
+	thirdPath := filepath.Join(home, "project-c")
+	if err := os.Mkdir(thirdPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	thirdRequest, err := workspaces.RequestRegistrationLocal(ctx, "project-c", thirdPath, "test-local-user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := workspaces.ApproveRegistration(ctx, thirdRequest.ID, "test-local-user"); err != nil {
+		t.Fatal(err)
+	}
+	workspacePage := call("workspace_list", map[string]any{"limit": 1, "offset": 0})
+	if workspacePage.IsError {
+		t.Fatalf("workspace_list page: %v", workspacePage.Content)
+	}
+	workspacePageData := structured(workspacePage)
+	if values, ok := workspacePageData["workspaces"].([]any); !ok || len(values) != 1 {
+		t.Fatalf("workspace page returned %v rows, want 1", lenOrInvalid(values, ok))
+	}
+	if workspacePageData["nextOffset"] != float64(1) {
+		t.Fatalf("workspace page nextOffset = %v, want 1", workspacePageData["nextOffset"])
+	}
+	workspacePage = call("workspace_list", map[string]any{"limit": 1, "offset": 1})
+	if workspacePage.IsError {
+		t.Fatalf("workspace_list second page: %v", workspacePage.Content)
+	}
+	workspacePageData = structured(workspacePage)
+	if values, ok := workspacePageData["workspaces"].([]any); !ok || len(values) != 1 {
+		t.Fatalf("workspace second page returned %v rows, want 1", lenOrInvalid(values, ok))
+	}
+	if _, ok := workspacePageData["nextOffset"]; ok {
+		t.Fatalf("workspace second page unexpectedly has nextOffset %v", workspacePageData["nextOffset"])
+	}
 	started := call("codex_start_task", map[string]any{"workspaceId": "project-a", "prompt": "Review the package structure."})
 	if started.IsError {
 		t.Fatalf("codex_start_task: %v", started.Content)
@@ -216,8 +249,51 @@ func TestAllMCPContractsThroughAuthenticatedHTTP(t *testing.T) {
 		t.Fatalf("second workspace request: %v", pending.Content)
 	}
 	secondRequestID := structured(pending)["requestId"].(string)
+	for _, id := range []string{"project-d", "project-e"} {
+		path := filepath.Join(home, id)
+		if err := os.Mkdir(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if result := call("workspace_register", map[string]any{"workspaceId": id, "path": path}); result.IsError {
+			t.Fatalf("pending workspace %s: %v", id, result.Content)
+		}
+	}
+	for i := 0; i < 2; i++ {
+		if _, err := approvals.CreatePending(ctx, service.ApprovalInput{OperationType: "fixture.inspect", TargetResource: "fixture", Parameters: map[string]any{"index": i}}); err != nil {
+			t.Fatal(err)
+		}
+	}
 	if result := call("approval_list_pending", map[string]any{}); result.IsError {
 		t.Fatalf("approval_list_pending: %v", result.Content)
+	}
+	approvalPage := call("approval_list_pending", map[string]any{"limit": 1, "offset": 0})
+	if approvalPage.IsError {
+		t.Fatalf("approval_list_pending page: %v", approvalPage.Content)
+	}
+	approvalPageData := structured(approvalPage)
+	for _, key := range []string{"workspaceRegistrations", "operationApprovals"} {
+		if values, ok := approvalPageData[key].([]any); !ok || len(values) != 1 {
+			t.Fatalf("%s page returned %v rows, want 1", key, lenOrInvalid(values, ok))
+		}
+	}
+	if approvalPageData["workspaceRegistrationsNextOffset"] != float64(1) || approvalPageData["operationApprovalsNextOffset"] != float64(1) {
+		t.Fatalf("approval page offsets = %v / %v, want 1 / 1", approvalPageData["workspaceRegistrationsNextOffset"], approvalPageData["operationApprovalsNextOffset"])
+	}
+	approvalPage = call("approval_list_pending", map[string]any{"limit": 1, "offset": 1})
+	if approvalPage.IsError {
+		t.Fatalf("approval_list_pending second page: %v", approvalPage.Content)
+	}
+	approvalPageData = structured(approvalPage)
+	for _, key := range []string{"workspaceRegistrations", "operationApprovals"} {
+		if values, ok := approvalPageData[key].([]any); !ok || len(values) != 1 {
+			t.Fatalf("%s second page returned %v rows, want 1", key, lenOrInvalid(values, ok))
+		}
+	}
+	if approvalPageData["workspaceRegistrationsNextOffset"] != float64(2) {
+		t.Fatalf("workspace registration nextOffset = %v, want 2", approvalPageData["workspaceRegistrationsNextOffset"])
+	}
+	if _, ok := approvalPageData["operationApprovalsNextOffset"]; ok {
+		t.Fatalf("operation approvals second page unexpectedly has nextOffset %v", approvalPageData["operationApprovalsNextOffset"])
 	}
 	if result := call("approval_get_details", map[string]any{"approvalId": secondRequestID}); result.IsError {
 		t.Fatalf("approval_get_details: %v", result.Content)
@@ -246,6 +322,13 @@ func TestAllMCPContractsThroughAuthenticatedHTTP(t *testing.T) {
 	if err != nil || auditRows == 0 {
 		t.Fatalf("audit rows=%d err=%v", auditRows, err)
 	}
+}
+
+func lenOrInvalid(values []any, ok bool) any {
+	if !ok {
+		return "invalid"
+	}
+	return len(values)
 }
 
 func TestNewHTTPHandlerProtectsMCPDiscoveryAndHealth(t *testing.T) {

@@ -125,7 +125,10 @@ func (c *Client) start(ctx context.Context) error {
 	initCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 	var initialized map[string]any
-	if err := c.call(initCtx, "initialize", map[string]any{"clientInfo": map[string]string{"name": "codex-chatgpt-bridge", "title": "Codex ChatGPT Bridge", "version": "0.1.0"}}, &initialized); err != nil {
+	if err := c.call(initCtx, "initialize", map[string]any{
+		"clientInfo":   map[string]string{"name": "codex-chatgpt-bridge", "title": "Codex ChatGPT Bridge", "version": "0.1.0"},
+		"capabilities": map[string]bool{"experimentalApi": true},
+	}, &initialized); err != nil {
 		_ = c.close()
 		return fmt.Errorf("initialize Codex App Server: %w", err)
 	}

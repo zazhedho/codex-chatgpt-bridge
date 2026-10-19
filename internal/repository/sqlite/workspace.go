@@ -30,6 +30,41 @@ func (s *Store) ListWorkspaces(ctx context.Context) ([]domain.Workspace, error) 
 	return result, rows.Err()
 }
 
+func (s *Store) ListWorkspacesPage(ctx context.Context, limit, offset int) ([]domain.Workspace, bool, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, root_path, root_device, root_inode, created_at, git_repository FROM workspaces ORDER BY id LIMIT ? OFFSET ?`, limit+1, offset)
+	if err != nil {
+		return nil, false, err
+	}
+	defer rows.Close()
+	result := make([]domain.Workspace, 0, limit)
+	for rows.Next() {
+		if len(result) == limit {
+			return result, true, nil
+		}
+		var w domain.Workspace
+		var created int64
+		if err := rows.Scan(&w.ID, &w.RootPath, &w.RootDevice, &w.RootInode, &created, &w.GitRepository); err != nil {
+			return nil, false, err
+		}
+		w.CreatedAt = time.UnixMilli(created).UTC()
+		result = append(result, w)
+	}
+	return result, false, rows.Err()
+}
+
+func (s *Store) HasWorkspaceConflict(ctx context.Context, id, rootPath string, now time.Time) (bool, error) {
+	if _, err := s.db.ExecContext(ctx, `UPDATE workspace_requests SET status='expired' WHERE status='pending' AND expires_at <= ? AND (workspace_id=? OR root_path=?)`, now.UnixMilli(), id, rootPath); err != nil {
+		return false, err
+	}
+	var exists bool
+	err := s.db.QueryRowContext(ctx, `SELECT EXISTS(
+		SELECT 1 FROM workspaces WHERE id=? OR root_path=?
+		UNION ALL
+		SELECT 1 FROM workspace_requests WHERE status='pending' AND expires_at>? AND (workspace_id=? OR root_path=?))`,
+		id, rootPath, now.UnixMilli(), id, rootPath).Scan(&exists)
+	return exists, err
+}
+
 func (s *Store) GetWorkspace(ctx context.Context, id string) (domain.Workspace, error) {
 	var w domain.Workspace
 	var created int64
@@ -78,6 +113,46 @@ func (s *Store) ListPendingWorkspaceRequests(ctx context.Context, now time.Time)
 		requests = append(requests, r)
 	}
 	return requests, rows.Err()
+}
+
+func (s *Store) ListPendingWorkspaceRequestsPage(ctx context.Context, now time.Time, limit, offset int) ([]domain.WorkspaceRequest, bool, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, workspace_id, root_path, status, created_at, expires_at FROM workspace_requests WHERE status='pending' AND expires_at>? ORDER BY created_at, id LIMIT ? OFFSET ?`, now.UnixMilli(), limit+1, offset)
+	if err != nil {
+		return nil, false, err
+	}
+	defer rows.Close()
+	requests := make([]domain.WorkspaceRequest, 0, limit)
+	for rows.Next() {
+		if len(requests) == limit {
+			return requests, true, nil
+		}
+		var r domain.WorkspaceRequest
+		var created, expires int64
+		if err := rows.Scan(&r.ID, &r.WorkspaceID, &r.RootPath, &r.Status, &created, &expires); err != nil {
+			return nil, false, err
+		}
+		r.CreatedAt, r.ExpiresAt = time.UnixMilli(created).UTC(), time.UnixMilli(expires).UTC()
+		requests = append(requests, r)
+	}
+	return requests, false, rows.Err()
+}
+
+func (s *Store) GetPendingWorkspaceRequest(ctx context.Context, id string, now time.Time) (domain.WorkspaceRequest, error) {
+	if _, err := s.db.ExecContext(ctx, `UPDATE workspace_requests SET status='expired' WHERE id=? AND status='pending' AND expires_at <= ?`, id, now.UnixMilli()); err != nil {
+		return domain.WorkspaceRequest{}, err
+	}
+	var r domain.WorkspaceRequest
+	var created, expires int64
+	err := s.db.QueryRowContext(ctx, `SELECT id, workspace_id, root_path, status, created_at, expires_at FROM workspace_requests WHERE id=? AND status='pending'`, id).
+		Scan(&r.ID, &r.WorkspaceID, &r.RootPath, &r.Status, &created, &expires)
+	if errors.Is(err, sql.ErrNoRows) {
+		return domain.WorkspaceRequest{}, domain.ErrNotFound
+	}
+	if err != nil {
+		return domain.WorkspaceRequest{}, err
+	}
+	r.CreatedAt, r.ExpiresAt = time.UnixMilli(created).UTC(), time.UnixMilli(expires).UTC()
+	return r, nil
 }
 
 func (s *Store) GetWorkspaceRequest(ctx context.Context, id string) (domain.WorkspaceRequest, error) {
