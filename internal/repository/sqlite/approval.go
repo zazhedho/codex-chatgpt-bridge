@@ -117,6 +117,26 @@ func (s *Store) ListPendingApprovals(ctx context.Context, now time.Time) ([]doma
 	return values, rows.Err()
 }
 
+func (s *Store) ListPendingApprovalsPage(ctx context.Context, now time.Time, limit, offset int) ([]domain.Approval, bool, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, COALESCE(workspace_id,''), operation, target, parameters_json, parameters_hash, NULLIF(artifact_hash,''), status, COALESCE(approved_by,''), created_at, expires_at, consumed_at FROM approvals WHERE status='pending' AND expires_at>? ORDER BY created_at, id LIMIT ? OFFSET ?`, now.UnixMilli(), limit+1, offset)
+	if err != nil {
+		return nil, false, err
+	}
+	defer rows.Close()
+	values := make([]domain.Approval, 0, limit)
+	for rows.Next() {
+		if len(values) == limit {
+			return values, true, nil
+		}
+		value, err := scanApproval(rows)
+		if err != nil {
+			return nil, false, err
+		}
+		values = append(values, value)
+	}
+	return values, false, rows.Err()
+}
+
 func (s *Store) GetApproval(ctx context.Context, id string) (domain.Approval, error) {
 	return scanApproval(s.db.QueryRowContext(ctx, `SELECT id, COALESCE(workspace_id,''), operation, target, parameters_json, parameters_hash, NULLIF(artifact_hash,''), status, COALESCE(approved_by,''), created_at, expires_at, consumed_at FROM approvals WHERE id=?`, id))
 }

@@ -17,6 +17,7 @@ import (
 	"example.com/codex-chatgpt-bridge/internal/config"
 	mcphandler "example.com/codex-chatgpt-bridge/internal/handler/mcp"
 	"example.com/codex-chatgpt-bridge/internal/repository/sqlite"
+	"example.com/codex-chatgpt-bridge/internal/security"
 	"example.com/codex-chatgpt-bridge/internal/service"
 	"example.com/codex-chatgpt-bridge/internal/worker"
 )
@@ -25,6 +26,13 @@ func Run() error {
 	cfg, err := config.Load()
 	if err != nil {
 		return err
+	}
+	var cloudflareVerifier security.AccessAssertionVerifier
+	if cfg.AuthMode == config.AuthModeCloudflareAccess {
+		cloudflareVerifier, err = security.NewCloudflareAccessVerifier(cfg.CloudflareIssuer, cfg.CloudflareAudience, cfg.CloudflareAllowedEmails)
+		if err != nil {
+			return fmt.Errorf("configure Cloudflare Access authentication: %w", err)
+		}
 	}
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	store, err := sqlite.Open(cfg.DataDir)
@@ -69,7 +77,7 @@ func Run() error {
 	tasks := service.NewTaskService(store, store, workspaces, workers, codexAdapter, auditLogger, cfg.MaxPromptBytes)
 	approvals := service.NewApprovalService(store, workspaces)
 	startedAt := time.Now()
-	handler := mcphandler.NewHTTPHandler(mcphandler.Dependencies{Config: cfg, Workspaces: workspaces, Tasks: tasks, Approvals: approvals, Audit: auditLogger, Codex: codexAdapter, StartedAt: startedAt, Logger: logger})
+	handler := mcphandler.NewHTTPHandler(mcphandler.Dependencies{Config: cfg, CloudflareVerifier: cloudflareVerifier, Workspaces: workspaces, Tasks: tasks, Approvals: approvals, Audit: auditLogger, Codex: codexAdapter, StartedAt: startedAt, Logger: logger})
 	server := &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 << 10}
 	listener, err := net.Listen("tcp", net.JoinHostPort(cfg.Host, fmt.Sprint(cfg.Port)))
 	if err != nil {

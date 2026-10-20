@@ -96,11 +96,15 @@ while IFS= read -r line; do
   printf '%s\n' "$line" >> "$capture"
   case "$line" in
     *'"method":"initialize"'*) printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"userAgent":"codex-fixture/0.163.0 (macOS)"}}' ;;
-    *'"method":"thread/start"'*) printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thread-fixture"}}}' ;;
+    *'"method":"thread/start"'*) printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thread-fixture"},"activePermissionProfile":{"id":"bridge-readonly","extends":":read-only"},"sandbox":{"type":"readOnly","networkAccess":false}}}' ;;
     *'"method":"turn/start"'*)
       printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"turn-fixture"}}}'
       printf '%s\n' '{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":"thread-fixture","turnId":"turn-fixture","delta":"BRIDGE_MCP_CODEX_TURN_OK"}}'
-      printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thread-fixture","turn":{"id":"turn-fixture","status":"completed","items":[]}}}' ;;
+      printf '%s\n' '{"jsonrpc":"2.0","method":"item/commandExecution/outputDelta","params":{"threadId":"thread-fixture","turnId":"turn-fixture","delta":"Operation not permitted"}}'
+      printf '%s\n' '{"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"thread-fixture","turnId":"turn-fixture","item":{"id":"command-fixture","type":"commandExecution","aggregatedOutput":"final command result: operation not permitted","exitCode":1}}}'
+      printf '%s\n' '{"jsonrpc":"2.0","method":"rawResponseItem/completed","params":{"threadId":"thread-fixture","turnId":"turn-fixture","item":{"type":"local_shell_call","call_id":"call-fixture","status":"completed","action":{"type":"exec","command":["cat","fixture"]}}}}'
+      printf '%s\n' '{"jsonrpc":"2.0","method":"rawResponseItem/completed","params":{"threadId":"thread-fixture","turnId":"turn-fixture","item":{"type":"function_call_output","call_id":"call-fixture","name":"local_shell","output":"captured local shell output"}}}'
+      printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thread-fixture","turn":{"id":"turn-fixture","status":"completed","items":[{"id":"command-final","type":"commandExecution","aggregatedOutput":"final turn command output: operation not permitted","exitCode":1}]}}}' ;;
   esac
 done
 `
@@ -112,9 +116,10 @@ done
 		t.Fatal(err)
 	}
 	var threads []string
+	var progress []string
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	result, err := adapter.Run(ctx, TaskRequest{TaskID: "task-fixture", Workspace: domain.Workspace{ID: "fixture", RootPath: root}, Prompt: "Read fixture", OnThread: func(thread, turn string) error { threads = append(threads, thread+"/"+turn); return nil }})
+	result, err := adapter.Run(ctx, TaskRequest{TaskID: "task-fixture", Workspace: domain.Workspace{ID: "fixture", RootPath: root}, Prompt: "Read fixture", OnThread: func(thread, turn string) error { threads = append(threads, thread+"/"+turn); return nil }, OnProgress: func(value string) { progress = append(progress, value) }})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -124,15 +129,30 @@ done
 	if len(threads) != 2 || threads[0] != "thread-fixture/" || threads[1] != "thread-fixture/turn-fixture" {
 		t.Fatalf("thread callbacks: %v", threads)
 	}
+	if !strings.Contains(strings.Join(progress, "\n"), "Codex command output: Operation not permitted") {
+		t.Fatal("sandbox tool output was not distinguishable from agent-authored progress")
+	}
+	if !strings.Contains(strings.Join(progress, "\n"), "Codex command output: final command result: operation not permitted") {
+		t.Fatal("completed command output was not captured from the App Server item event")
+	}
+	if !strings.Contains(strings.Join(progress, "\n"), "Codex command output: final turn command output: operation not permitted") {
+		t.Fatal("command output from the completed turn was not captured")
+	}
+	if !strings.Contains(strings.Join(progress, "\n"), "Codex App Server raw response item completed: local_shell_call") || !strings.Contains(strings.Join(progress, "\n"), "Codex local shell call completed") || !strings.Contains(strings.Join(progress, "\n"), "Codex command output: captured local shell output") {
+		t.Fatal("raw App Server local shell execution evidence was not captured")
+	}
 	lines, err := os.ReadFile(capture)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var start, turn map[string]any
+	var initialize, start, turn map[string]any
 	for _, line := range strings.Split(strings.TrimSpace(string(lines)), "\n") {
 		var request map[string]any
 		if json.Unmarshal([]byte(line), &request) != nil {
 			continue
+		}
+		if request["method"] == "initialize" {
+			initialize = request
 		}
 		if request["method"] == "thread/start" {
 			start = request
@@ -140,6 +160,11 @@ done
 		if request["method"] == "turn/start" {
 			turn = request
 		}
+	}
+	initParams, _ := initialize["params"].(map[string]any)
+	capabilities, _ := initParams["capabilities"].(map[string]any)
+	if capabilities["experimentalApi"] != true {
+		t.Fatal("App Server initialization did not opt into the experimental raw response events used for sandbox evidence")
 	}
 	config, ok := start["params"].(map[string]any)["config"].(map[string]any)
 	if !ok {
@@ -153,6 +178,67 @@ done
 	}
 }
 
+func TestAdapterRejectsUnsafeEffectiveSandboxForNewAndResumedThreads(t *testing.T) {
+	for _, test := range []struct {
+		name, threadID, response string
+	}{
+		{"new-profile-mismatch", "", `{"thread":{"id":"thread-fixture"},"activePermissionProfile":{"id":"other-profile","extends":":read-only"},"sandbox":{"type":"readOnly","networkAccess":false}}`},
+		{"new-writable-sandbox", "", `{"thread":{"id":"thread-fixture"},"activePermissionProfile":{"id":"bridge-readonly","extends":":read-only"},"sandbox":{"type":"workspaceWrite","networkAccess":false}}`},
+		{"resume-profile-mismatch", "thread-fixture", `{"thread":{"id":"thread-fixture"},"activePermissionProfile":{"id":"other-profile","extends":":read-only"},"sandbox":{"type":"readOnly","networkAccess":false}}`},
+		{"resume-network-enabled", "thread-fixture", `{"thread":{"id":"thread-fixture"},"activePermissionProfile":{"id":"bridge-readonly","extends":":read-only"},"sandbox":{"type":"readOnly","networkAccess":true}}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			capture := filepath.Join(t.TempDir(), "protocol.jsonl")
+			body := `capture='` + capture + `'
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$capture"
+  case "$line" in
+    *'"method":"initialize"'*) printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"userAgent":"codex-fixture/0.163.0"}}' ;;
+    *'"method":"thread/start"'*|*'"method":"thread/resume"'*) printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":` + test.response + `}' ;;
+    *'"method":"turn/start"'*) printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"turn-fixture"}}}'; printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thread-fixture","turn":{"id":"turn-fixture","status":"completed","items":[]}}}' ;;
+  esac
+done
+`
+			client := NewClient(fakeCodex(t, body), slog.New(slog.NewTextHandler(io.Discard, nil)))
+			adapter := NewAdapter(client, 1024)
+			defer adapter.Close()
+			root := filepath.Join(t.TempDir(), "workspace")
+			if err := os.Mkdir(root, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_, err := adapter.Run(ctx, TaskRequest{Workspace: domain.Workspace{ID: "fixture", RootPath: root}, Prompt: "read fixture", ThreadID: test.threadID})
+			lines, readErr := os.ReadFile(capture)
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			var methods []string
+			for _, line := range strings.Split(strings.TrimSpace(string(lines)), "\n") {
+				var request map[string]any
+				if json.Unmarshal([]byte(line), &request) == nil {
+					if method, ok := request["method"].(string); ok {
+						methods = append(methods, method)
+					}
+				}
+			}
+			if err == nil || !strings.Contains(strings.ToLower(err.Error()), "effective sandbox") {
+				t.Fatalf("adapter did not fail closed on effective sandbox mismatch: err=%v methods=%v", err, methods)
+			}
+			method := "thread/start"
+			if test.threadID != "" {
+				method = "thread/resume"
+			}
+			if !strings.Contains(string(lines), `"method":"`+method+`"`) {
+				t.Fatal("adapter did not reach the requested thread operation")
+			}
+			if strings.Contains(string(lines), `"method":"turn/start"`) {
+				t.Fatal("adapter started a turn after receiving an unsafe effective sandbox")
+			}
+		})
+	}
+}
+
 func TestCancellationDuringTurnStartStillInterruptsStartedTurn(t *testing.T) {
 	capture := filepath.Join(t.TempDir(), "protocol.jsonl")
 	body := `capture='` + capture + `'
@@ -160,7 +246,7 @@ while IFS= read -r line; do
   printf '%s\n' "$line" >> "$capture"
   case "$line" in
     *'"method":"initialize"'*) printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"userAgent":"codex-fixture/0.163.0 (macOS)"}}' ;;
-    *'"method":"thread/start"'*) printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thread-fixture"}}}' ;;
+    *'"method":"thread/start"'*) printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thread-fixture"},"activePermissionProfile":{"id":"bridge-readonly","extends":":read-only"},"sandbox":{"type":"readOnly","networkAccess":false}}}' ;;
     *'"method":"turn/start"'*) sleep 0.2; printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"turn-fixture"}}}' ;;
     *'"method":"turn/interrupt"'*)
       id=$(printf '%s' "$line" | sed -E 's/.*"id":([0-9]+).*/\1/')

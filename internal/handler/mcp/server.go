@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"net"
 	"net/http"
 	"regexp"
+	"strconv"
 	"time"
 
 	"example.com/codex-chatgpt-bridge/internal/audit"
@@ -20,17 +22,34 @@ import (
 type CodexStatus interface{ Connected() bool }
 
 type Dependencies struct {
-	Config     config.Config
-	Workspaces *service.WorkspaceService
-	Tasks      *service.TaskService
-	Approvals  *service.ApprovalService
-	Audit      *audit.Logger
-	Codex      CodexStatus
-	StartedAt  time.Time
-	Logger     *slog.Logger
+	Config             config.Config
+	Workspaces         *service.WorkspaceService
+	Tasks              *service.TaskService
+	Approvals          *service.ApprovalService
+	Audit              *audit.Logger
+	Codex              CodexStatus
+	CloudflareVerifier security.AccessAssertionVerifier
+	StartedAt          time.Time
+	Logger             *slog.Logger
 }
 
 type Empty struct{}
+type PageInput struct {
+	Limit  *int `json:"limit,omitempty" jsonschema:"Optional page size from 1 to 10; defaults to 10"`
+	Offset *int `json:"offset,omitempty" jsonschema:"Optional stable offset; defaults to 0"`
+}
+
+func (in PageInput) values() (int, int) {
+	limit, offset := 0, 0
+	if in.Limit != nil {
+		limit = *in.Limit
+	}
+	if in.Offset != nil {
+		offset = *in.Offset
+	}
+	return limit, offset
+}
+
 type WorkspaceIDInput struct {
 	WorkspaceID string `json:"workspaceId" jsonschema:"Registered workspace ID"`
 }
@@ -73,6 +92,7 @@ type SandboxPermissionsDTO struct {
 }
 type WorkspaceListOutput struct {
 	Workspaces []WorkspaceDTO `json:"workspaces"`
+	NextOffset *int           `json:"nextOffset,omitempty"`
 }
 type WorkspaceOutput struct {
 	Workspace WorkspaceDTO `json:"workspace"`
@@ -156,8 +176,10 @@ type OperationApprovalDTO struct {
 	ExpiresAt      int64                 `json:"expiresAt"`
 }
 type ApprovalListOutput struct {
-	WorkspaceRegistrations []RegistrationApprovalDTO `json:"workspaceRegistrations"`
-	OperationApprovals     []OperationApprovalDTO    `json:"operationApprovals"`
+	WorkspaceRegistrations           []RegistrationApprovalDTO `json:"workspaceRegistrations"`
+	WorkspaceRegistrationsNextOffset *int                      `json:"workspaceRegistrationsNextOffset,omitempty"`
+	OperationApprovals               []OperationApprovalDTO    `json:"operationApprovals"`
+	OperationApprovalsNextOffset     *int                      `json:"operationApprovalsNextOffset,omitempty"`
 }
 type ApprovalDetailsOutput struct {
 	Details map[string]any `json:"details"`
@@ -183,6 +205,9 @@ type CapabilitiesOutput struct {
 
 var taskIDPattern = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$`)
 
+const maxToolResponseBytes = 1 << 20
+const firstStatelessProtocolVersion = "2026-07-28"
+
 func NewServer(deps Dependencies) *mcp.Server {
 	logger := deps.Logger
 	if logger == nil {
@@ -190,12 +215,13 @@ func NewServer(deps Dependencies) *mcp.Server {
 	}
 	server := mcp.NewServer(&mcp.Implementation{Name: "codex-chatgpt-bridge", Title: "Codex ChatGPT Bridge", Version: "0.2.0"}, &mcp.ServerOptions{Logger: logger, KeepAlive: 30 * time.Second})
 
-	register(server, deps, "workspace_list", "List explicitly registered workspaces.", true, false, true, func(ctx context.Context, _ Empty) (WorkspaceListOutput, error) {
-		values, err := deps.Workspaces.List(ctx)
+	register(server, deps, "workspace_list", "List approved workspaces using stable offset pages of up to 10 entries. Omitted limit defaults to 10; use nextOffset to continue.", true, false, true, func(ctx context.Context, in PageInput) (WorkspaceListOutput, error) {
+		limit, offset := in.values()
+		values, nextOffset, err := deps.Workspaces.ListPage(ctx, limit, offset)
 		if err != nil {
 			return WorkspaceListOutput{}, err
 		}
-		out := WorkspaceListOutput{Workspaces: make([]WorkspaceDTO, 0, len(values))}
+		out := WorkspaceListOutput{Workspaces: make([]WorkspaceDTO, 0, len(values)), NextOffset: nextOffset}
 		for _, item := range values {
 			out.Workspaces = append(out.Workspaces, workspaceDTO(item))
 		}
@@ -290,12 +316,13 @@ func NewServer(deps Dependencies) *mcp.Server {
 		task, err := deps.Tasks.Cancel(ctx, in.TaskID)
 		return CancelOutput{TaskID: task.ID, Status: task.Status}, err
 	})
-	register(server, deps, "approval_list_pending", "List pending workspace registration and operation approval details. Approvals remain local.", true, false, true, func(ctx context.Context, _ Empty) (ApprovalListOutput, error) {
-		requests, approvals, err := deps.Approvals.ListPending(ctx)
+	register(server, deps, "approval_list_pending", "List pending workspace registrations and operation approvals with separate nextOffset values. Each list returns up to 10 entries; approvals remain local.", true, false, true, func(ctx context.Context, in PageInput) (ApprovalListOutput, error) {
+		limit, offset := in.values()
+		requests, requestsNext, approvals, approvalsNext, err := deps.Approvals.ListPendingPage(ctx, limit, offset)
 		if err != nil {
 			return ApprovalListOutput{}, err
 		}
-		out := ApprovalListOutput{WorkspaceRegistrations: make([]RegistrationApprovalDTO, 0, len(requests)), OperationApprovals: make([]OperationApprovalDTO, 0, len(approvals))}
+		out := ApprovalListOutput{WorkspaceRegistrations: make([]RegistrationApprovalDTO, 0, len(requests)), WorkspaceRegistrationsNextOffset: requestsNext, OperationApprovals: make([]OperationApprovalDTO, 0, len(approvals)), OperationApprovalsNextOffset: approvalsNext}
 		for _, request := range requests {
 			out.WorkspaceRegistrations = append(out.WorkspaceRegistrations, RegistrationApprovalDTO{RequestID: request.ID, WorkspaceID: request.WorkspaceID, RootPath: request.RootPath, ExpiresAt: request.ExpiresAt.UnixMilli()})
 		}
@@ -338,10 +365,39 @@ func NewServer(deps Dependencies) *mcp.Server {
 
 func NewHTTPHandler(deps Dependencies) http.Handler {
 	server := NewServer(deps)
-	mcpHandler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return server }, &mcp.StreamableHTTPOptions{JSONResponse: true, SessionTimeout: 30 * time.Minute, MaxRequestBodyBytes: deps.Config.MaxRequestBytes})
+	newStreamableHandler := func(stateless bool) http.Handler {
+		return mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return server }, &mcp.StreamableHTTPOptions{JSONResponse: true, Stateless: stateless, SessionTimeout: 30 * time.Minute, MaxRequestBodyBytes: deps.Config.MaxRequestBytes})
+	}
+	legacyMCPHandler := newStreamableHandler(false)
+	statelessMCPHandler := newStreamableHandler(true)
+	mcpHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// MCP protocol versions are ISO dates; 2026-07-28 introduced stateless per-request metadata.
+		if r.Header.Get("MCP-Protocol-Version") >= firstStatelessProtocolVersion {
+			statelessMCPHandler.ServeHTTP(w, r)
+			return
+		}
+		legacyMCPHandler.ServeHTTP(w, r)
+	})
 	mux := http.NewServeMux()
-	mux.Handle("/mcp", security.AuthMiddlewareForHost(deps.Config.AuthToken, deps.Config.Host, deps.Config.Port, mcpHandler))
-	mux.Handle("/healthz", security.AuthMiddlewareForHost(deps.Config.AuthToken, deps.Config.Host, deps.Config.Port, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	var authenticate func(http.Handler) http.Handler
+	switch deps.Config.AuthMode {
+	case config.AuthModeBearer:
+		authenticate = func(next http.Handler) http.Handler {
+			return security.AuthMiddlewareForHost(deps.Config.AuthToken, deps.Config.Host, deps.Config.Port, next)
+		}
+	case config.AuthModeCloudflareAccess:
+		authenticate = func(next http.Handler) http.Handler {
+			return security.CloudflareAccessMiddlewareForHost(deps.CloudflareVerifier, net.JoinHostPort(deps.Config.Host, strconv.Itoa(deps.Config.Port)), next)
+		}
+	default:
+		authenticate = func(next http.Handler) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				http.Error(w, "Authentication unavailable", http.StatusServiceUnavailable)
+			})
+		}
+	}
+	mux.Handle("/mcp", authenticate(mcpHandler))
+	mux.Handle("/healthz", authenticate(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"status":"ok"}`))
@@ -368,6 +424,15 @@ func register[In any, Out any](server *mcp.Server, deps Dependencies, name, desc
 			}
 		}
 		output, err := handler(ctx, input)
+		if err == nil {
+			encoded, marshalErr := json.Marshal(output)
+			switch {
+			case marshalErr != nil:
+				err = domain.ErrServiceUnavailable
+			case len(encoded) > maxToolResponseBytes:
+				err = domain.ErrResponseTooLarge
+			}
+		}
 		if err != nil {
 			if deps.Audit != nil {
 				_ = deps.Audit.Record(ctx, audit.Event{Operation: "mcp.tool." + name, Principal: principal, WorkspaceID: workspaceID, TaskID: taskID, Outcome: "failed", ErrorClass: errorClass(err)})
@@ -397,6 +462,8 @@ func toolError(err error) *mcp.CallToolResult {
 		text = "Task queue is full"
 	case errors.Is(err, domain.ErrServiceUnavailable):
 		text = "Bridge service is unavailable"
+	case errors.Is(err, domain.ErrResponseTooLarge):
+		text = "Response exceeds bridge output limit"
 	}
 	return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: text}}, IsError: true}
 }
@@ -415,6 +482,8 @@ func errorClass(err error) string {
 		return "queue_full"
 	case errors.Is(err, domain.ErrServiceUnavailable):
 		return "unavailable"
+	case errors.Is(err, domain.ErrResponseTooLarge):
+		return "response_too_large"
 	default:
 		return "internal"
 	}

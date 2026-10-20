@@ -21,8 +21,8 @@ func TestOpenMigratesAndProtectsDatabaseFiles(t *testing.T) {
 	if err := store.db.QueryRow("SELECT COUNT(*) FROM schema_migrations").Scan(&migrations); err != nil {
 		t.Fatal(err)
 	}
-	if migrations != 1 {
-		t.Fatalf("migration count = %d, want 1", migrations)
+	if migrations != 2 {
+		t.Fatalf("migration count = %d, want 2", migrations)
 	}
 	for _, file := range []string{store.path, store.path + "-wal", store.path + "-shm"} {
 		info, err := os.Stat(file)

@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"strings"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 
 type ApprovalRepository interface {
 	ListPendingApprovals(context.Context, time.Time) ([]domain.Approval, error)
+	ListPendingApprovalsPage(context.Context, time.Time, int, int) ([]domain.Approval, bool, error)
 	GetApproval(context.Context, string) (domain.Approval, error)
 	InsertApproval(context.Context, domain.Approval, string) error
 	ApproveApproval(context.Context, string, string, time.Time) (domain.Approval, error)
@@ -106,22 +108,26 @@ func (s *ApprovalService) ConsumeOnce(ctx context.Context, id string, parameters
 	return s.repo.ConsumeApproval(ctx, id, hex.EncodeToString(parameterHash[:]), artifactHash, s.now().UTC())
 }
 
-func (s *ApprovalService) ListPending(ctx context.Context) ([]domain.WorkspaceRequest, []domain.Approval, error) {
+func (s *ApprovalService) ListPendingPage(ctx context.Context, limit, offset int) ([]domain.WorkspaceRequest, *int, []domain.Approval, *int, error) {
 	if _, ok := security.Authorize(ctx); !ok {
-		return nil, nil, domain.ErrNotAuthorized
+		return nil, nil, nil, nil, domain.ErrNotAuthorized
 	}
-	requests, err := s.workspaces.PendingRequests(ctx)
+	limit, offset, err := pageBounds(limit, offset)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, nil, err
 	}
-	approvals, err := s.repo.ListPendingApprovals(ctx, s.now())
+	requests, requestsNext, err := s.workspaces.PendingRequestsPage(ctx, limit, offset)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, nil, err
+	}
+	approvals, approvalsMore, err := s.repo.ListPendingApprovalsPage(ctx, s.now(), limit, offset)
+	if err != nil {
+		return nil, nil, nil, nil, err
 	}
 	for i := range approvals {
 		approvals[i].ParametersJSON = redactJSON(approvals[i].ParametersJSON)
 	}
-	return requests, approvals, nil
+	return requests, requestsNext, approvals, pageNextOffset(offset, limit, approvalsMore), nil
 }
 
 func (s *ApprovalService) ListPendingLocal(ctx context.Context) ([]domain.Approval, error) {
@@ -148,14 +154,10 @@ func (s *ApprovalService) Get(ctx context.Context, id string) (map[string]any, e
 	if _, ok := security.Authorize(ctx); !ok {
 		return nil, domain.ErrNotAuthorized
 	}
-	if requests, err := s.workspaces.PendingRequests(ctx); err != nil {
+	if request, err := s.workspaces.PendingRequest(ctx, id); err == nil {
+		return map[string]any{"id": request.ID, "type": "workspace_registration", "workspaceId": request.WorkspaceID, "rootPath": request.RootPath, "status": request.Status, "expiresAt": request.ExpiresAt.UnixMilli()}, nil
+	} else if !errors.Is(err, domain.ErrNotFound) {
 		return nil, err
-	} else {
-		for _, request := range requests {
-			if request.ID == id {
-				return map[string]any{"id": request.ID, "type": "workspace_registration", "workspaceId": request.WorkspaceID, "rootPath": request.RootPath, "status": request.Status, "expiresAt": request.ExpiresAt.UnixMilli()}, nil
-			}
-		}
 	}
 	approval, err := s.repo.GetApproval(ctx, id)
 	if err != nil {

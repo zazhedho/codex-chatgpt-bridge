@@ -2,6 +2,7 @@ package codex
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"strings"
 	"sync"
@@ -93,6 +94,9 @@ func (a *Adapter) Run(ctx context.Context, request TaskRequest) (TaskResult, err
 		if err := a.callStart("thread/start", params, &response); err != nil {
 			return TaskResult{}, err
 		}
+		if err := validateEffectiveSandbox(response); err != nil {
+			return TaskResult{}, err
+		}
 		threadID = nestedID(response, "thread")
 		if threadID == "" {
 			return TaskResult{}, errors.New("Codex App Server returned no thread ID")
@@ -101,6 +105,9 @@ func (a *Adapter) Run(ctx context.Context, request TaskRequest) (TaskResult, err
 		var response map[string]any
 		params := map[string]any{"threadId": threadID, "cwd": request.Workspace.RootPath, "approvalPolicy": "never", "config": profile.AppServerConfig(), "excludeTurns": true}
 		if err := a.callStart("thread/resume", params, &response); err != nil {
+			return TaskResult{}, err
+		}
+		if err := validateEffectiveSandbox(response); err != nil {
 			return TaskResult{}, err
 		}
 		if id := nestedID(response, "thread"); id != "" && id != threadID {
@@ -150,6 +157,18 @@ func (a *Adapter) Run(ctx context.Context, request TaskRequest) (TaskResult, err
 	}
 }
 
+func validateEffectiveSandbox(response map[string]any) error {
+	profile, ok := response["activePermissionProfile"].(map[string]any)
+	if !ok || profile["id"] != "bridge-readonly" || profile["extends"] != ":read-only" {
+		return errors.New("Codex App Server effective sandbox profile does not match bridge read-only policy")
+	}
+	sandbox, ok := response["sandbox"].(map[string]any)
+	if !ok || sandbox["type"] != "readOnly" || sandbox["networkAccess"] != false {
+		return errors.New("Codex App Server effective sandbox mode does not match bridge read-only policy")
+	}
+	return nil
+}
+
 func (a *Adapter) callStart(method string, params, output any) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -180,15 +199,36 @@ func (a *Adapter) onNotification(method string, params map[string]any) {
 		run.progress("Codex turn started")
 	case "item/started":
 		run.progress("Codex started a work item")
+	case "item/completed":
+		item, _ := params["item"].(map[string]any)
+		if item["type"] == "commandExecution" {
+			if output := stringValue(item["aggregatedOutput"]); output != "" {
+				run.progress("Codex command output: " + bounded(output, 1_800))
+			}
+		}
 	case "item/agentMessage/delta":
 		if delta := stringValue(params["delta"]); delta != "" {
 			run.appendText(delta)
+			run.progress(delta)
+		}
+	case "item/plan/delta":
+		if delta := stringValue(params["delta"]); delta != "" {
 			run.progress(delta)
 		}
 	case "turn/diff/updated":
 		run.setDiff(stringValue(params["diff"]))
 	case "turn/completed":
 		turn, _ := params["turn"].(map[string]any)
+		items, _ := turn["items"].([]any)
+		for _, raw := range items {
+			item, ok := raw.(map[string]any)
+			if !ok || item["type"] != "commandExecution" {
+				continue
+			}
+			if output := stringValue(item["aggregatedOutput"]); output != "" {
+				run.progress("Codex command output: " + bounded(output, 1_800))
+			}
+		}
 		status := domain.TaskStatus(stringValue(turn["status"]))
 		if status != domain.TaskSucceeded && status != domain.TaskFailed && status != domain.TaskInterrupted {
 			return
@@ -201,13 +241,52 @@ func (a *Adapter) onNotification(method string, params map[string]any) {
 			result.Error = stringValue(errValue["message"])
 		}
 		run.finish(result)
-	case "item/plan/delta", "item/commandExecution/outputDelta", "command/exec/outputDelta", "process/outputDelta":
-		if delta := stringValue(params["delta"]); delta != "" {
-			run.progress(delta)
-		} else if output := stringValue(params["output"]); output != "" {
-			run.progress(output)
+	case "item/commandExecution/outputDelta", "command/exec/outputDelta", "process/outputDelta":
+		if output := commandOutput(params); output != "" {
+			run.progress("Codex command output: " + bounded(output, 1_800))
+		}
+	case "rawResponseItem/completed":
+		item, _ := params["item"].(map[string]any)
+		itemType := stringValue(item["type"])
+		if itemType != "" {
+			run.progress("Codex App Server raw response item completed: " + itemType)
+		}
+		switch itemType {
+		case "local_shell_call":
+			if item["status"] == "completed" {
+				run.progress("Codex local shell call completed")
+			}
+		case "function_call_output":
+			if output := commandOutput(item); output != "" {
+				run.progress("Codex command output: " + bounded(output, 1_800))
+			}
 		}
 	}
+}
+
+func commandOutput(params map[string]any) string {
+	if delta := stringValue(params["delta"]); delta != "" {
+		return delta
+	}
+	if output := stringValue(params["output"]); output != "" {
+		return output
+	}
+	if chunks, ok := params["output"].([]any); ok {
+		var output strings.Builder
+		for _, raw := range chunks {
+			chunk, _ := raw.(map[string]any)
+			output.WriteString(stringValue(chunk["text"]))
+		}
+		if output.Len() > 0 {
+			return output.String()
+		}
+	}
+	encoded := stringValue(params["deltaBase64"])
+	decoded, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		return ""
+	}
+	return strings.ToValidUTF8(string(decoded), "�")
 }
 
 func (r *activeRun) progress(value string) {

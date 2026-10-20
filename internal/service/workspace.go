@@ -17,9 +17,13 @@ var workspaceIDPattern = regexp.MustCompile(`^[a-z][a-z0-9-]{1,62}$`)
 
 type WorkspaceRepository interface {
 	ListWorkspaces(context.Context) ([]domain.Workspace, error)
+	ListWorkspacesPage(context.Context, int, int) ([]domain.Workspace, bool, error)
+	HasWorkspaceConflict(context.Context, string, string, time.Time) (bool, error)
 	GetWorkspace(context.Context, string) (domain.Workspace, error)
 	InsertWorkspaceRequest(context.Context, domain.WorkspaceRequest) error
 	ListPendingWorkspaceRequests(context.Context, time.Time) ([]domain.WorkspaceRequest, error)
+	ListPendingWorkspaceRequestsPage(context.Context, time.Time, int, int) ([]domain.WorkspaceRequest, bool, error)
+	GetPendingWorkspaceRequest(context.Context, string, time.Time) (domain.WorkspaceRequest, error)
 	GetWorkspaceRequest(context.Context, string) (domain.WorkspaceRequest, error)
 	ApproveWorkspaceRequest(context.Context, string, domain.Workspace) error
 	SetWorkspaceRequestStatus(context.Context, string, string) error
@@ -42,6 +46,27 @@ func (s *WorkspaceService) List(ctx context.Context) ([]domain.Workspace, error)
 		return nil, domain.ErrNotAuthorized
 	}
 	return s.list(ctx)
+}
+
+func (s *WorkspaceService) ListPage(ctx context.Context, limit, offset int) ([]domain.Workspace, *int, error) {
+	if _, ok := security.Authorize(ctx); !ok {
+		return nil, nil, domain.ErrNotAuthorized
+	}
+	limit, offset, err := pageBounds(limit, offset)
+	if err != nil {
+		return nil, nil, err
+	}
+	workspaces, hasMore, err := s.repo.ListWorkspacesPage(ctx, limit, offset)
+	if err != nil {
+		return nil, nil, err
+	}
+	valid := make([]domain.Workspace, 0, len(workspaces))
+	for _, workspace := range workspaces {
+		if err := security.RevalidateWorkspaceRoot(security.WorkspaceRoot{Path: workspace.RootPath, Device: workspace.RootDevice, Inode: workspace.RootInode}, s.home, s.codexHome); err == nil {
+			valid = append(valid, workspace)
+		}
+	}
+	return valid, pageNextOffset(offset, limit, hasMore), nil
 }
 
 func (s *WorkspaceService) ListLocal(ctx context.Context) ([]domain.Workspace, error) {
@@ -102,23 +127,12 @@ func (s *WorkspaceService) requestRegistration(ctx context.Context, id, inputPat
 	if err != nil {
 		return domain.WorkspaceRequest{}, domain.ErrInvalidInput
 	}
-	workspaces, err := s.repo.ListWorkspaces(ctx)
+	conflict, err := s.repo.HasWorkspaceConflict(ctx, id, root.Path, s.now())
 	if err != nil {
 		return domain.WorkspaceRequest{}, err
 	}
-	requests, err := s.repo.ListPendingWorkspaceRequests(ctx, s.now())
-	if err != nil {
-		return domain.WorkspaceRequest{}, err
-	}
-	for _, workspace := range workspaces {
-		if workspace.ID == id || workspace.RootPath == root.Path {
-			return domain.WorkspaceRequest{}, domain.ErrConflict
-		}
-	}
-	for _, request := range requests {
-		if request.WorkspaceID == id || request.RootPath == root.Path {
-			return domain.WorkspaceRequest{}, domain.ErrConflict
-		}
+	if conflict {
+		return domain.WorkspaceRequest{}, domain.ErrConflict
 	}
 	requestID, err := newID()
 	if err != nil {
@@ -189,6 +203,28 @@ func (s *WorkspaceService) PendingRequests(ctx context.Context) ([]domain.Worksp
 		return nil, domain.ErrNotAuthorized
 	}
 	return s.repo.ListPendingWorkspaceRequests(ctx, s.now())
+}
+
+func (s *WorkspaceService) PendingRequest(ctx context.Context, id string) (domain.WorkspaceRequest, error) {
+	if _, ok := security.Authorize(ctx); !ok {
+		return domain.WorkspaceRequest{}, domain.ErrNotAuthorized
+	}
+	return s.repo.GetPendingWorkspaceRequest(ctx, id, s.now())
+}
+
+func (s *WorkspaceService) PendingRequestsPage(ctx context.Context, limit, offset int) ([]domain.WorkspaceRequest, *int, error) {
+	if _, ok := security.Authorize(ctx); !ok {
+		return nil, nil, domain.ErrNotAuthorized
+	}
+	limit, offset, err := pageBounds(limit, offset)
+	if err != nil {
+		return nil, nil, err
+	}
+	requests, hasMore, err := s.repo.ListPendingWorkspaceRequestsPage(ctx, s.now(), limit, offset)
+	if err != nil {
+		return nil, nil, err
+	}
+	return requests, pageNextOffset(offset, limit, hasMore), nil
 }
 
 func (s *WorkspaceService) PendingRequestsLocal(ctx context.Context) ([]domain.WorkspaceRequest, error) {
