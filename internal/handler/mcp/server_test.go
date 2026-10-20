@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -9,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -76,6 +78,182 @@ func (accessVerifierStub) Verify(_ context.Context, assertion string) (string, e
 		return "", errors.New("invalid assertion")
 	}
 	return "zaqi@example.com", nil
+}
+
+func TestModernServerDiscoveryAndToolsList(t *testing.T) {
+	handler := NewHTTPHandler(Dependencies{
+		Config:             config.Config{Host: "127.0.0.1", Port: 8787, AuthMode: config.AuthModeCloudflareAccess, MaxRequestBytes: 64 << 10},
+		CloudflareVerifier: accessVerifierStub{},
+	})
+	request := func(method, id, version, host, origin string) *httptest.ResponseRecorder {
+		t.Helper()
+		payload, err := json.Marshal(map[string]any{
+			"jsonrpc": "2.0",
+			"id":      id,
+			"method":  method,
+			"params": map[string]any{"_meta": map[string]any{
+				"io.modelcontextprotocol/protocolVersion":    version,
+				"io.modelcontextprotocol/clientCapabilities": map[string]any{},
+				"io.modelcontextprotocol/clientInfo":         map[string]any{"name": "ChatGPT", "version": "discovery-test"},
+			}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8787/mcp", strings.NewReader(string(payload)))
+		if host == "" {
+			host = "127.0.0.1:8787"
+		}
+		req.Host = host
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "application/json, text/event-stream")
+		req.Header.Set("MCP-Protocol-Version", version)
+		req.Header.Set("Mcp-Method", method)
+		req.Header.Set("Cf-Access-Jwt-Assertion", "synthetic-access-assertion")
+		if origin != "" {
+			req.Header.Set("Origin", origin)
+		}
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, req)
+		return response
+	}
+	assertServerInfo := func(t *testing.T, metadata map[string]json.RawMessage) {
+		t.Helper()
+		var info struct {
+			Name    string `json:"name"`
+			Version string `json:"version"`
+		}
+		if err := json.Unmarshal(metadata["io.modelcontextprotocol/serverInfo"], &info); err != nil {
+			t.Fatalf("serverInfo missing or invalid: %v", err)
+		}
+		if info.Name != "codex-chatgpt-bridge" || info.Version == "" {
+			t.Fatalf("serverInfo = %+v", info)
+		}
+	}
+
+	discovery := request("server/discover", "discover-1", "2026-07-28", "", "")
+	if discovery.Code != http.StatusOK || !strings.HasPrefix(discovery.Header().Get("Content-Type"), "application/json") {
+		t.Fatalf("discover response status=%d content-type=%q body=%s", discovery.Code, discovery.Header().Get("Content-Type"), discovery.Body.String())
+	}
+	var discovered struct {
+		JSONRPC string `json:"jsonrpc"`
+		ID      any    `json:"id"`
+		Result  struct {
+			ResultType        string                     `json:"resultType"`
+			SupportedVersions []string                   `json:"supportedVersions"`
+			Capabilities      map[string]json.RawMessage `json:"capabilities"`
+			Meta              map[string]json.RawMessage `json:"_meta"`
+		} `json:"result"`
+		Error *struct {
+			Code    int    `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(discovery.Body.Bytes(), &discovered); err != nil {
+		t.Fatalf("decode discover response: %v; body=%s", err, discovery.Body.String())
+	}
+	if discovered.JSONRPC != "2.0" || discovered.ID != "discover-1" || discovered.Error != nil {
+		t.Fatalf("invalid discover envelope: %+v", discovered)
+	}
+	if discovered.Result.ResultType != "complete" || !slices.Contains(discovered.Result.SupportedVersions, "2026-07-28") {
+		t.Fatalf("discover did not negotiate 2026-07-28: resultType=%q supported=%v body=%s", discovered.Result.ResultType, discovered.Result.SupportedVersions, discovery.Body.String())
+	}
+	if _, ok := discovered.Result.Capabilities["tools"]; !ok {
+		t.Fatal("discover capabilities omit tools")
+	}
+	assertServerInfo(t, discovered.Result.Meta)
+	t.Logf("server/discover: HTTP %d %s id=%v resultType=%s supportedVersions=%v toolsCapability=true serverInfo=%s", discovery.Code, discovery.Header().Get("Content-Type"), discovered.ID, discovered.Result.ResultType, discovered.Result.SupportedVersions, discovered.Result.Meta["io.modelcontextprotocol/serverInfo"])
+
+	tools := request("tools/list", "tools-1", "2026-07-28", "", "")
+	if tools.Code != http.StatusOK || !strings.HasPrefix(tools.Header().Get("Content-Type"), "application/json") {
+		t.Fatalf("tools/list response status=%d content-type=%q body=%s", tools.Code, tools.Header().Get("Content-Type"), tools.Body.String())
+	}
+	var listed struct {
+		JSONRPC string `json:"jsonrpc"`
+		ID      any    `json:"id"`
+		Result  struct {
+			Tools []struct {
+				Name string `json:"name"`
+			} `json:"tools"`
+			Meta map[string]json.RawMessage `json:"_meta"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(tools.Body.Bytes(), &listed); err != nil {
+		t.Fatalf("decode tools/list response: %v; body=%s", err, tools.Body.String())
+	}
+	if listed.JSONRPC != "2.0" || listed.ID != "tools-1" || len(listed.Result.Tools) != 15 {
+		t.Fatalf("tools/list envelope or count invalid: jsonrpc=%q id=%v tools=%d", listed.JSONRPC, listed.ID, len(listed.Result.Tools))
+	}
+	assertServerInfo(t, listed.Result.Meta)
+	t.Logf("tools/list: HTTP %d %s id=%v tools=%d serverInfo=%s", tools.Code, tools.Header().Get("Content-Type"), listed.ID, len(listed.Result.Tools), listed.Result.Meta["io.modelcontextprotocol/serverInfo"])
+
+	invalidVersion := request("tools/list", "invalid-1", "2025-01-01", "", "")
+	if invalidVersion.Code != http.StatusBadRequest {
+		t.Fatalf("unsupported protocol version accepted: %s", invalidVersion.Body.String())
+	}
+	if wrongHost := request("server/discover", "wrong-host", "2026-07-28", "attacker.example:8787", ""); wrongHost.Code != http.StatusForbidden {
+		t.Fatalf("modern discovery accepted invalid Host: status=%d", wrongHost.Code)
+	}
+	if wrongOrigin := request("server/discover", "wrong-origin", "2026-07-28", "", "https://attacker.example"); wrongOrigin.Code != http.StatusForbidden {
+		t.Fatalf("modern discovery accepted invalid Origin: status=%d", wrongOrigin.Code)
+	}
+}
+
+func TestLegacyMCPInitializeAndToolsListRemainSupported(t *testing.T) {
+	handler := NewHTTPHandler(Dependencies{
+		Config:             config.Config{Host: "127.0.0.1", Port: 8787, AuthMode: config.AuthModeCloudflareAccess, MaxRequestBytes: 64 << 10},
+		CloudflareVerifier: accessVerifierStub{},
+	})
+	post := func(body, protocolVersion, sessionID string) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8787/mcp", strings.NewReader(body))
+		req.Host = "127.0.0.1:8787"
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "application/json, text/event-stream")
+		req.Header.Set("Cf-Access-Jwt-Assertion", "synthetic-access-assertion")
+		if protocolVersion != "" {
+			req.Header.Set("MCP-Protocol-Version", protocolVersion)
+		}
+		if sessionID != "" {
+			req.Header.Set("Mcp-Session-Id", sessionID)
+		}
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, req)
+		return response
+	}
+	initialized := post(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"legacy-test","version":"1"}}}`, "", "")
+	if initialized.Code != http.StatusOK {
+		t.Fatalf("legacy initialize status=%d body=%s", initialized.Code, initialized.Body.String())
+	}
+	sessionID := initialized.Header().Get("Mcp-Session-Id")
+	if sessionID == "" {
+		t.Fatal("legacy initialize did not return a session ID")
+	}
+	if response := post(`{"jsonrpc":"2.0","method":"notifications/initialized"}`, "2025-11-25", sessionID); response.Code != http.StatusAccepted {
+		t.Fatalf("legacy initialized notification status=%d body=%s", response.Code, response.Body.String())
+	}
+	listed := post(`{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}`, "2025-11-25", sessionID)
+	if listed.Code != http.StatusOK {
+		t.Fatalf("legacy tools/list status=%d body=%s", listed.Code, listed.Body.String())
+	}
+	var response struct {
+		Result struct {
+			Tools []json.RawMessage `json:"tools"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(listed.Body.Bytes(), &response); err != nil || len(response.Result.Tools) != 15 {
+		t.Fatalf("legacy tools/list invalid: tools=%d err=%v body=%s", len(response.Result.Tools), err, listed.Body.String())
+	}
+	closeRequest := httptest.NewRequest(http.MethodDelete, "http://127.0.0.1:8787/mcp", nil)
+	closeRequest.Host = "127.0.0.1:8787"
+	closeRequest.Header.Set("Cf-Access-Jwt-Assertion", "synthetic-access-assertion")
+	closeRequest.Header.Set("MCP-Protocol-Version", "2025-11-25")
+	closeRequest.Header.Set("Mcp-Session-Id", sessionID)
+	closed := httptest.NewRecorder()
+	handler.ServeHTTP(closed, closeRequest)
+	if closed.Code != http.StatusNoContent {
+		t.Fatalf("legacy session close status=%d body=%s", closed.Code, closed.Body.String())
+	}
 }
 
 func TestAllMCPContractsThroughAuthenticatedHTTP(t *testing.T) {

@@ -65,7 +65,7 @@ func LoadFromEnv(env map[string]string) (Config, error) {
 		}
 		issuer = strings.TrimSpace(env["BRIDGE_CLOUDFLARE_ISSUER"])
 		if !validCloudflareIssuer(issuer) {
-			return Config{}, errors.New("BRIDGE_CLOUDFLARE_ISSUER must be an HTTPS origin")
+			return Config{}, errors.New("BRIDGE_CLOUDFLARE_ISSUER must be an HTTPS Cloudflare Access team origin")
 		}
 		audience = strings.TrimSpace(env["BRIDGE_CLOUDFLARE_AUDIENCE"])
 		if audience == "" {
@@ -133,7 +133,11 @@ func LoadFromEnv(env map[string]string) (Config, error) {
 
 func validCloudflareIssuer(value string) bool {
 	parsed, err := url.Parse(value)
-	return err == nil && parsed.Scheme == "https" && parsed.Host != "" && parsed.User == nil && parsed.Path == "" && parsed.RawQuery == "" && parsed.Fragment == ""
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.Port() != "" || parsed.User != nil || parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return false
+	}
+	team, ok := strings.CutSuffix(strings.ToLower(parsed.Hostname()), ".cloudflareaccess.com")
+	return ok && team != ""
 }
 
 func parseAllowedEmails(value string) ([]string, error) {

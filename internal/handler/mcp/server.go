@@ -206,6 +206,7 @@ type CapabilitiesOutput struct {
 var taskIDPattern = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$`)
 
 const maxToolResponseBytes = 1 << 20
+const firstStatelessProtocolVersion = "2026-07-28"
 
 func NewServer(deps Dependencies) *mcp.Server {
 	logger := deps.Logger
@@ -364,7 +365,19 @@ func NewServer(deps Dependencies) *mcp.Server {
 
 func NewHTTPHandler(deps Dependencies) http.Handler {
 	server := NewServer(deps)
-	mcpHandler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return server }, &mcp.StreamableHTTPOptions{JSONResponse: true, SessionTimeout: 30 * time.Minute, MaxRequestBodyBytes: deps.Config.MaxRequestBytes})
+	newStreamableHandler := func(stateless bool) http.Handler {
+		return mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return server }, &mcp.StreamableHTTPOptions{JSONResponse: true, Stateless: stateless, SessionTimeout: 30 * time.Minute, MaxRequestBodyBytes: deps.Config.MaxRequestBytes})
+	}
+	legacyMCPHandler := newStreamableHandler(false)
+	statelessMCPHandler := newStreamableHandler(true)
+	mcpHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// MCP protocol versions are ISO dates; 2026-07-28 introduced stateless per-request metadata.
+		if r.Header.Get("MCP-Protocol-Version") >= firstStatelessProtocolVersion {
+			statelessMCPHandler.ServeHTTP(w, r)
+			return
+		}
+		legacyMCPHandler.ServeHTTP(w, r)
+	})
 	mux := http.NewServeMux()
 	var authenticate func(http.Handler) http.Handler
 	switch deps.Config.AuthMode {

@@ -1,6 +1,6 @@
 # Cloudflare Access + ChatGPT MCP
 
-Status: local Cloudflare JWT auth is implemented and tested. No Cloudflare resources, DNS records, Access applications, tunnel, or ChatGPT connector have been created. The account, plan, domain, and ChatGPT workspace are not verified.
+Status: local Cloudflare JWT auth is implemented and tested. Keep account-specific tunnel IDs, hostnames, AUD tags, and identities out of this repository. Verify live Cloudflare and ChatGPT state separately before use; this runbook does not certify account billing or connector readiness.
 
 ## Cost and compatibility
 
@@ -15,7 +15,9 @@ Status: local Cloudflare JWT auth is implemented and tested. No Cloudflare resou
 `BRIDGE_AUTH_MODE` selects one exclusive mode:
 
 - `bearer` (default): the current local `BRIDGE_AUTH_TOKEN` flow.
-- `cloudflare_access`: only `Cf-Access-Jwt-Assertion` is accepted. There is no bearer fallback. The bridge verifies an RS256 JWT against the Cloudflare issuer's JWKS, checks issuer, audience, required expiration and not-before, subject, and an exact allowed-email list. JWKS is fetched over HTTPS with a five-minute cache; unknown key IDs trigger refresh, and stale keys are not used after expiry if refresh fails.
+- `cloudflare_access`: only `Cf-Access-Jwt-Assertion` is accepted. There is no bearer fallback. The bridge verifies an RS256 JWT against the Cloudflare issuer's JWKS, checks issuer, audience, required expiration and not-before strictly (no clock-skew allowance), subject, and an exact allowed-email list. Keep the Mac clock synchronized. JWKS is fetched over HTTPS with a five-minute cache; unknown key IDs trigger refresh, and stale keys are not used after expiry if refresh fails.
+
+Production issuer configuration must be the HTTPS Cloudflare Access team origin (`https://<team>.cloudflareaccess.com`), with no path or explicit port. The application audience must be copied from that Access application's AUD tag. Cloudflare documents that Managed OAuth access tokens are opaque and Access sends the signed JWT assertion to the origin.
 
 Both modes keep the listener on loopback. Cloudflare identity does not approve a workspace: remote registration stays pending until the existing local admin workflow approves it. Workspace authorization and Codex's read-only sandbox remain unchanged.
 
@@ -58,8 +60,9 @@ Cloudflare documents the `httpHostHeader` and origin Access `required`, `teamNam
 3. Check local unauthenticated `/mcp` and `/healthz` requests: they must fail. A bare `Authorization: Bearer ...` must also fail in Cloudflare mode.
 4. Start `cloudflared` in the foreground. Check the named tunnel's healthy status in its dashboard. Keep the Cloudflare Access origin JWT requirement enabled.
 5. From an unauthenticated client, confirm Access returns its managed OAuth challenge/metadata and does not reach an MCP tool. Inspect metadata only; never print tokens.
-6. Confirm the authorization-server metadata advertises `authorization_code`, `refresh_token`, `S256`, DCR, public-client token authentication, and RFC 8707 `resource`. Confirm the Access policy denies an identity outside the allowlist.
-7. After a separate Gate C authorization, add the custom MCP connection privately in ChatGPT. Use the exact endpoint `https://mcp.<YOUR_DOMAIN>/mcp`, test OAuth and tool discovery from ChatGPT Web, and verify no write or privileged operation was enabled. Do not publish it to a workspace.
+6. Check protected-resource metadata for the exact MCP resource URI and authorization server. Check authorization-server metadata for its endpoints, authorization-code and refresh grants, `S256`, DCR, and public-client token auth (`none`). ChatGPT sends the RFC 8707 `resource` parameter during authorization and token exchange; confirm it works in the actual OAuth flow.
+7. If authorization-server metadata omits `authorization_response_iss_parameter_supported: true`, OpenAI documents a callback-ID-specific redirect: `https://chatgpt.com/connector/oauth/{callback_id}`. Get the exact callback URI from the ChatGPT connector UI. Add that exact URI to Cloudflare Managed OAuth's allowed redirect URIs; do not invent the ID or use a wildcard.
+8. After authorization, add the custom MCP connection privately in ChatGPT. Use the exact MCP URL configured in Cloudflare, test OAuth and tool discovery from ChatGPT Web, and verify no write or privileged operation was enabled. Do not publish it to a workspace.
 
 Local unit/integration tests use synthetic signing keys and a fake assertion verifier for MCP transport. They do not prove Cloudflare account eligibility, tunnel health, DNS, Managed OAuth, or ChatGPT end-to-end behavior.
 

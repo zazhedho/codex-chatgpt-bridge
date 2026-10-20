@@ -56,6 +56,7 @@ func TestLoadFromEnvRejectsIncompleteOrUnsafeCloudflareAccessConfig(t *testing.T
 	for name, change := range map[string]func(map[string]string){
 		"missing issuer":   func(env map[string]string) { delete(env, "BRIDGE_CLOUDFLARE_ISSUER") },
 		"non-https issuer": func(env map[string]string) { env["BRIDGE_CLOUDFLARE_ISSUER"] = "http://team.cloudflareaccess.com" },
+		"non-cloudflare issuer": func(env map[string]string) { env["BRIDGE_CLOUDFLARE_ISSUER"] = "https://attacker.example" },
 		"issuer path": func(env map[string]string) {
 			env["BRIDGE_CLOUDFLARE_ISSUER"] = "https://team.cloudflareaccess.com/other"
 		},

@@ -82,7 +82,7 @@ func (v *CloudflareAccessVerifier) Verify(ctx context.Context, assertion string)
 		return "", errors.New("invalid Cloudflare Access assertion")
 	}
 	claims := &accessClaims{}
-	parser := jwt.NewParser(jwt.WithValidMethods([]string{"RS256"}), jwt.WithIssuer(v.issuer), jwt.WithAudience(v.audience), jwt.WithExpirationRequired(), jwt.WithLeeway(30*time.Second))
+	parser := jwt.NewParser(jwt.WithValidMethods([]string{"RS256"}), jwt.WithIssuer(v.issuer), jwt.WithAudience(v.audience), jwt.WithExpirationRequired())
 	token, err := parser.ParseWithClaims(assertion, claims, func(token *jwt.Token) (any, error) {
 		kid, ok := token.Header["kid"].(string)
 		if !ok || kid == "" || token.Method.Alg() != "RS256" {
