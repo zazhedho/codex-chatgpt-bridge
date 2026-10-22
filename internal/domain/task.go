@@ -4,6 +4,13 @@ import "time"
 
 type TaskStatus string
 
+type ExecutionMode string
+
+const (
+	ExecutionReadOnly       ExecutionMode = "read-only"
+	ExecutionWorkspaceWrite ExecutionMode = "workspace-write"
+)
+
 const (
 	TaskQueued          TaskStatus = "queued"
 	TaskRunning         TaskStatus = "running"
@@ -22,6 +29,7 @@ type ProgressEvent struct {
 type Task struct {
 	ID            string
 	WorkspaceID   string
+	ExecutionMode ExecutionMode
 	ThreadID      string
 	TurnID        string
 	Status        TaskStatus
@@ -43,7 +51,7 @@ func (t *Task) Transition(next TaskStatus) error {
 	case TaskRunning:
 		allowed = next == TaskWaitingApproval || next == TaskSucceeded || next == TaskFailed || next == TaskCancelled || next == TaskInterrupted
 	case TaskWaitingApproval:
-		allowed = next == TaskRunning || next == TaskFailed || next == TaskCancelled || next == TaskInterrupted
+		allowed = next == TaskQueued || next == TaskRunning || next == TaskFailed || next == TaskCancelled || next == TaskInterrupted
 	}
 	if !allowed {
 		return ErrInvalidTaskTransition

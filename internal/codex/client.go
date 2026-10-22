@@ -17,6 +17,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/zazhedho/codex-chatgpt-bridge/internal/domain"
 )
 
 const maxProtocolLine = 1 << 20
@@ -148,11 +150,158 @@ func (c *Client) start(ctx context.Context) error {
 
 func (c *Client) Call(ctx context.Context, method string, params any, output any) error {
 	switch method {
-	case "thread/start", "thread/resume", "turn/start", "turn/interrupt":
+	case "thread/start", "thread/resume", "thread/list", "thread/read", "turn/start", "turn/interrupt":
 	default:
 		return errors.New("Codex App Server method is not allowed")
 	}
 	return c.call(ctx, method, params, output)
+}
+
+// ListCLISessions uses the App Server catalog, scoped to one exact workspace path.
+func (c *Client) ListCLISessions(ctx context.Context, workspacePath string) ([]domain.CodexSession, error) {
+	var sessions []domain.CodexSession
+	seen := make(map[string]struct{})
+	var cursor string
+	for page := 0; page < 10; page++ {
+		result, err := c.ListCLISessionsPage(ctx, workspacePath, "", cursor, 100)
+		if err != nil {
+			return nil, err
+		}
+		for _, session := range result.Sessions {
+			if _, duplicate := seen[session.ID]; duplicate {
+				return nil, errors.New("Codex App Server repeated a thread across pages")
+			}
+			seen[session.ID] = struct{}{}
+			sessions = append(sessions, session)
+		}
+		next := result.NextCursor
+		if next == "" {
+			return sessions, nil
+		}
+		if next == cursor {
+			return nil, errors.New("Codex App Server repeated a thread list cursor")
+		}
+		cursor = next
+	}
+	return nil, errors.New("Codex App Server thread list exceeds the local discovery limit")
+}
+
+// ListCLISessionsPage returns only metadata from the installed App Server's thread/list API.
+func (c *Client) ListCLISessionsPage(ctx context.Context, workspacePath, search, cursor string, limit int) (domain.CodexSessionPage, error) {
+	if (workspacePath != "" && (!filepath.IsAbs(workspacePath) || len(workspacePath) > 4096)) || len(search) > 200 || len(cursor) > 8192 || limit < 1 || limit > 100 {
+		return domain.CodexSessionPage{}, domain.ErrInvalidInput
+	}
+	if err := c.Start(ctx); err != nil {
+		return domain.CodexSessionPage{}, err
+	}
+	params := map[string]any{
+		"archived": false, "sourceKinds": []string{"cli", "vscode", "exec"},
+		"sortKey": "updated_at", "sortDirection": "desc", "limit": limit, "useStateDbOnly": true,
+	}
+	if workspacePath != "" {
+		params["cwd"] = []string{filepath.Clean(workspacePath)}
+	}
+	if search != "" {
+		params["searchTerm"] = search
+	}
+	if cursor != "" {
+		params["cursor"] = cursor
+	}
+	var response map[string]any
+	if err := c.Call(ctx, "thread/list", params, &response); err != nil {
+		return domain.CodexSessionPage{}, err
+	}
+	data, ok := response["data"].([]any)
+	if !ok {
+		return domain.CodexSessionPage{}, errors.New("invalid Codex App Server thread list")
+	}
+	page := domain.CodexSessionPage{Sessions: make([]domain.CodexSession, 0, len(data))}
+	for _, raw := range data {
+		value, ok := raw.(map[string]any)
+		if !ok {
+			return domain.CodexSessionPage{}, errors.New("invalid Codex App Server thread metadata")
+		}
+		session := sessionFromAppServer(value)
+		if session.ID == "" || session.Source == "" || session.WorkspacePath == "" {
+			return domain.CodexSessionPage{}, errors.New("incomplete Codex App Server thread metadata")
+		}
+		if !session.IsCodexCLISession() || (workspacePath != "" && filepath.Clean(session.WorkspacePath) != filepath.Clean(workspacePath)) {
+			continue
+		}
+		page.Sessions = append(page.Sessions, session)
+	}
+	page.NextCursor, _ = response["nextCursor"].(string)
+	if len(page.NextCursor) > 8192 {
+		return domain.CodexSessionPage{}, errors.New("invalid Codex App Server thread list cursor")
+	}
+	return page, nil
+}
+
+// ReadSessionMetadata requests thread metadata only; persisted turns stay inside Codex.
+func (c *Client) ReadSessionMetadata(ctx context.Context, threadID string) (domain.CodexSession, error) {
+	if threadID == "" || len(threadID) > 256 || strings.TrimSpace(threadID) != threadID {
+		return domain.CodexSession{}, domain.ErrInvalidInput
+	}
+	if err := c.Start(ctx); err != nil {
+		return domain.CodexSession{}, err
+	}
+	var response map[string]any
+	if err := c.Call(ctx, "thread/read", map[string]any{"threadId": threadID, "includeTurns": false}, &response); err != nil {
+		return domain.CodexSession{}, err
+	}
+	thread, ok := response["thread"].(map[string]any)
+	if !ok {
+		return domain.CodexSession{}, errors.New("invalid Codex App Server thread metadata")
+	}
+	session := sessionFromAppServer(thread)
+	if session.ID != threadID || session.Source == "" || session.WorkspacePath == "" {
+		return domain.CodexSession{}, errors.New("incomplete Codex App Server thread metadata")
+	}
+	return session, nil
+}
+
+func sessionFromAppServer(value map[string]any) domain.CodexSession {
+	return domain.CodexSession{
+		ID:            stringValue(value["id"]),
+		WorkspacePath: stringValue(value["cwd"]),
+		Source:        sessionSource(value["source"]),
+		Originator:    stringValue(value["originator"]),
+		Title:         stringValue(value["name"]),
+		Preview:       stringValue(value["preview"]),
+		Status:        sessionStatus(value["status"]),
+		CreatedAt:     unixTime(value["createdAt"]),
+		UpdatedAt:     unixTime(value["updatedAt"]),
+	}
+}
+
+func sessionSource(value any) string {
+	if source, ok := value.(string); ok {
+		return source
+	}
+	if source, ok := value.(map[string]any); ok {
+		if custom, ok := source["custom"].(string); ok {
+			return "custom:" + custom
+		}
+	}
+	return ""
+}
+
+func sessionStatus(value any) string {
+	if status, ok := value.(string); ok {
+		return status
+	}
+	if status, ok := value.(map[string]any); ok {
+		return stringValue(status["type"])
+	}
+	return ""
+}
+
+func unixTime(value any) time.Time {
+	seconds, ok := value.(float64)
+	if !ok || seconds <= 0 {
+		return time.Time{}
+	}
+	return time.Unix(int64(seconds), 0).UTC()
 }
 
 func (c *Client) call(ctx context.Context, method string, params any, output any) error {

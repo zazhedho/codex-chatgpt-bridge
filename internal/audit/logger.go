@@ -9,6 +9,7 @@ type Event struct {
 	Principal   string
 	WorkspaceID string
 	TaskID      string
+	ResourceID  string
 	Outcome     string
 	ErrorClass  string
 }

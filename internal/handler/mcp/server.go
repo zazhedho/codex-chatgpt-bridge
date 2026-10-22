@@ -11,12 +11,12 @@ import (
 	"strconv"
 	"time"
 
-	"example.com/codex-chatgpt-bridge/internal/audit"
-	"example.com/codex-chatgpt-bridge/internal/config"
-	"example.com/codex-chatgpt-bridge/internal/domain"
-	"example.com/codex-chatgpt-bridge/internal/security"
-	"example.com/codex-chatgpt-bridge/internal/service"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/zazhedho/codex-chatgpt-bridge/internal/audit"
+	"github.com/zazhedho/codex-chatgpt-bridge/internal/config"
+	"github.com/zazhedho/codex-chatgpt-bridge/internal/domain"
+	"github.com/zazhedho/codex-chatgpt-bridge/internal/security"
+	"github.com/zazhedho/codex-chatgpt-bridge/internal/service"
 )
 
 type CodexStatus interface{ Connected() bool }
@@ -25,6 +25,7 @@ type Dependencies struct {
 	Config             config.Config
 	Workspaces         *service.WorkspaceService
 	Tasks              *service.TaskService
+	Sessions           *service.SessionService
 	Approvals          *service.ApprovalService
 	Audit              *audit.Logger
 	Codex              CodexStatus
@@ -66,6 +67,30 @@ type TaskResumeInput struct {
 	ThreadID    string `json:"threadId"`
 	Prompt      string `json:"prompt"`
 }
+type SessionAttachInput struct {
+	WorkspaceID string `json:"workspaceId" jsonschema:"Approved workspace ID matching the Codex CLI session working directory"`
+	ThreadID    string `json:"threadId" jsonschema:"Codex CLI thread ID from local bridge-admin session discovery"`
+}
+type SessionCatalogInput struct {
+	WorkspaceID string `json:"workspaceId,omitempty" jsonschema:"Optional approved workspace filter"`
+	Search      string `json:"search,omitempty" jsonschema:"Optional case-insensitive search of each page's displayed session name"`
+	Limit       *int   `json:"limit,omitempty" jsonschema:"Optional page size from 1 to 50; defaults to 25"`
+	Cursor      string `json:"cursor,omitempty" jsonschema:"Opaque App Server pagination cursor from the previous page"`
+}
+type SessionProjectsInput struct {
+	ThreadID string `json:"threadId" jsonschema:"Codex CLI thread ID requiring project selection"`
+	Limit    *int   `json:"limit,omitempty" jsonschema:"Optional page size from 1 to 50; defaults to 25"`
+	Offset   *int   `json:"offset,omitempty" jsonschema:"Optional stable choice offset; defaults to 0"`
+}
+type SessionProjectBindingInput struct {
+	ThreadID  string `json:"threadId" jsonschema:"Codex CLI thread ID requiring project binding"`
+	ProjectID string `json:"projectId" jsonschema:"Opaque project ID returned by codex_list_session_projects"`
+}
+type TaskWriteInput struct {
+	WorkspaceID string `json:"workspaceId"`
+	Prompt      string `json:"prompt"`
+	ThreadID    string `json:"threadId,omitempty"`
+}
 type TaskIDInput struct {
 	TaskID string `json:"taskId"`
 }
@@ -81,6 +106,8 @@ type WorkspaceDTO struct {
 	SandboxPermissions   SandboxPermissionsDTO `json:"sandboxPermissions"`
 	AllowedOperations    []string              `json:"allowedOperations"`
 	ApprovalRequirements []string              `json:"approvalRequirements"`
+	WriteEnabled         bool                  `json:"writeEnabled"`
+	SessionTrusted       bool                  `json:"sessionTrusted"`
 	MaxConcurrentTasks   int                   `json:"maxConcurrentTasks"`
 	TimeoutMS            int64                 `json:"timeoutMs"`
 	GitRepository        *string               `json:"gitRepository"`
@@ -104,19 +131,59 @@ type RegistrationOutput struct {
 	ExpiresAt   int64  `json:"expiresAt"`
 }
 type ThreadSummaryDTO struct {
-	ThreadID  string            `json:"threadId"`
-	TaskID    string            `json:"taskId"`
-	Status    domain.TaskStatus `json:"status"`
-	UpdatedAt int64             `json:"updatedAt"`
+	ThreadID  string `json:"threadId"`
+	TaskID    string `json:"taskId,omitempty"`
+	Status    string `json:"status"`
+	Source    string `json:"source,omitempty"`
+	UpdatedAt int64  `json:"updatedAt"`
 }
 type ThreadListOutput struct {
 	Threads []ThreadSummaryDTO `json:"threads"`
 }
+type SessionAttachOutput struct {
+	RequestID   string `json:"requestId"`
+	ThreadID    string `json:"threadId"`
+	WorkspaceID string `json:"workspaceId"`
+	Status      string `json:"status"`
+	ExpiresAt   int64  `json:"expiresAt"`
+}
+type SessionProjectChoiceDTO struct {
+	ProjectID    string `json:"projectId"`
+	Name         string `json:"name"`
+	RelativePath string `json:"relativePath"`
+}
+type SessionProjectsOutput struct {
+	Projects   []SessionProjectChoiceDTO `json:"projects"`
+	NextOffset *int                      `json:"nextOffset,omitempty"`
+}
+type SessionProjectBindingOutput struct {
+	RequestID string `json:"requestId"`
+	ThreadID  string `json:"threadId"`
+	ProjectID string `json:"projectId"`
+	Status    string `json:"status"`
+	ExpiresAt int64  `json:"expiresAt"`
+}
+type SessionCatalogEntryDTO struct {
+	ThreadID         string `json:"threadId"`
+	DisplayName      string `json:"displayName"`
+	WorkspaceID      string `json:"workspaceId,omitempty"`
+	Project          string `json:"project"`
+	Status           string `json:"status"`
+	UpdatedAt        int64  `json:"updatedAt"`
+	ConnectionStatus string `json:"connectionStatus"`
+	CanResume        bool   `json:"canResume"`
+}
+type SessionCatalogOutput struct {
+	Sessions   []SessionCatalogEntryDTO `json:"sessions"`
+	NextCursor string                   `json:"nextCursor,omitempty"`
+}
 type TaskStartOutput struct {
-	TaskID    string            `json:"taskId"`
-	Status    domain.TaskStatus `json:"status"`
-	ThreadID  *string           `json:"threadId"`
-	CreatedAt int64             `json:"createdAt"`
+	TaskID        string               `json:"taskId"`
+	Status        domain.TaskStatus    `json:"status"`
+	ThreadID      *string              `json:"threadId"`
+	ExecutionMode domain.ExecutionMode `json:"executionMode,omitempty"`
+	ApprovalID    string               `json:"approvalId,omitempty"`
+	CreatedAt     int64                `json:"createdAt"`
 }
 type TaskDTO struct {
 	ID            string                 `json:"id"`
@@ -124,6 +191,7 @@ type TaskDTO struct {
 	ThreadID      *string                `json:"threadId"`
 	TurnID        *string                `json:"turnId"`
 	Status        domain.TaskStatus      `json:"status"`
+	ExecutionMode domain.ExecutionMode   `json:"executionMode"`
 	Progress      []domain.ProgressEvent `json:"progress"`
 	Result        *string                `json:"result"`
 	Diff          *string                `json:"diff"`
@@ -196,6 +264,7 @@ type CapabilitiesOutput struct {
 	CodexTransport      string `json:"codexTransport"`
 	Workspaces          string `json:"workspaces"`
 	CodexFilesystem     string `json:"codexFilesystem"`
+	WorkspaceWrite      string `json:"workspaceWrite"`
 	CodexNetwork        string `json:"codexNetwork"`
 	CodexMCPServers     string `json:"codexMcpServers"`
 	PrivilegedExecution string `json:"privilegedExecution"`
@@ -241,14 +310,56 @@ func NewServer(deps Dependencies) *mcp.Server {
 		}
 		return RegistrationOutput{RequestID: request.ID, WorkspaceID: request.WorkspaceID, Status: request.Status, ExpiresAt: request.ExpiresAt.UnixMilli()}, nil
 	})
-	register(server, deps, "codex_list_threads", "List threads created and owned by this bridge for the selected workspace.", true, false, true, func(ctx context.Context, in WorkspaceIDInput) (ThreadListOutput, error) {
+	register(server, deps, "codex_list_threads", "List bridge-created threads and Codex CLI threads explicitly attached to this approved workspace. Unattached CLI sessions are never listed here.", true, false, true, func(ctx context.Context, in WorkspaceIDInput) (ThreadListOutput, error) {
 		values, err := deps.Tasks.ListThreads(ctx, in.WorkspaceID)
 		if err != nil {
 			return ThreadListOutput{}, err
 		}
 		out := ThreadListOutput{Threads: make([]ThreadSummaryDTO, 0, len(values))}
 		for _, item := range values {
-			out.Threads = append(out.Threads, ThreadSummaryDTO{ThreadID: item.ThreadID, TaskID: item.TaskID, Status: item.Status, UpdatedAt: item.UpdatedAt})
+			out.Threads = append(out.Threads, ThreadSummaryDTO{ThreadID: item.ThreadID, TaskID: item.TaskID, Status: item.Status, Source: item.Source, UpdatedAt: item.UpdatedAt})
+		}
+		return out, nil
+	})
+	register(server, deps, "codex_list_local_sessions", "List one metadata-only page of local Codex CLI sessions sorted by recent activity. Global catalog access must first be granted locally; each result includes the Codex thread name or a sanitized, bounded thread preview. connectionStatus trusted_root means the session can resume read-only across repositories beneath exactly one approved root; trusted means repository-scoped. Unapproved locations cannot be resumed and conversation history is never returned.", true, false, true, func(ctx context.Context, in SessionCatalogInput) (SessionCatalogOutput, error) {
+		if deps.Sessions == nil {
+			return SessionCatalogOutput{}, domain.ErrServiceUnavailable
+		}
+		if len(in.WorkspaceID) > 63 || len(in.Search) > 200 || len(in.Cursor) > 8192 {
+			return SessionCatalogOutput{}, domain.ErrInvalidInput
+		}
+		limit := 0
+		if in.Limit != nil {
+			limit = *in.Limit
+		}
+		page, err := deps.Sessions.ListCatalog(ctx, in.WorkspaceID, in.Search, in.Cursor, limit)
+		if err != nil {
+			return SessionCatalogOutput{}, err
+		}
+		out := SessionCatalogOutput{Sessions: make([]SessionCatalogEntryDTO, 0, len(page.Sessions)), NextCursor: page.NextCursor}
+		for _, item := range page.Sessions {
+			out.Sessions = append(out.Sessions, SessionCatalogEntryDTO{ThreadID: item.ThreadID, DisplayName: item.DisplayName, WorkspaceID: item.WorkspaceID, Project: item.Project, Status: item.Status, UpdatedAt: item.UpdatedAt.UnixMilli(), ConnectionStatus: item.ConnectionStatus, CanResume: item.CanResume})
+		}
+		return out, nil
+	})
+	register(server, deps, "codex_list_session_projects", "List bounded, root-relative Git repository choices for a legacy Codex CLI session marked project_selection_required. Selecting a project only creates a local owner approval request; it does not grant access or enable writes. No conversation history or absolute paths are returned.", true, false, true, func(ctx context.Context, in SessionProjectsInput) (SessionProjectsOutput, error) {
+		if deps.Sessions == nil || len(in.ThreadID) == 0 || len(in.ThreadID) > 256 {
+			return SessionProjectsOutput{}, domain.ErrInvalidInput
+		}
+		limit, offset := 25, 0
+		if in.Limit != nil {
+			limit = *in.Limit
+		}
+		if in.Offset != nil {
+			offset = *in.Offset
+		}
+		choices, next, err := deps.Sessions.ListProjectChoices(ctx, in.ThreadID, offset, limit)
+		if err != nil {
+			return SessionProjectsOutput{}, err
+		}
+		out := SessionProjectsOutput{Projects: make([]SessionProjectChoiceDTO, 0, len(choices)), NextOffset: next}
+		for _, choice := range choices {
+			out.Projects = append(out.Projects, SessionProjectChoiceDTO{ProjectID: choice.ProjectID, Name: choice.Name, RelativePath: choice.RelativePath})
 		}
 		return out, nil
 	})
@@ -262,9 +373,58 @@ func NewServer(deps Dependencies) *mcp.Server {
 		}
 		return taskStartDTO(task), nil
 	})
-	register(server, deps, "codex_resume_thread", "Continue a thread previously created by this bridge in the same approved workspace.", false, false, false, func(ctx context.Context, in TaskResumeInput) (TaskStartOutput, error) {
+	register(server, deps, "codex_start_write_task", "Request a source-changing Codex task. It remains pending until this exact prompt is approved once through local bridge-admin; execution uses the approved workspace-write sandbox with network disabled.", false, true, false, func(ctx context.Context, in TaskWriteInput) (TaskStartOutput, error) {
+		if len(in.Prompt) > 64<<10 || len(in.ThreadID) > 256 {
+			return TaskStartOutput{}, domain.ErrInvalidInput
+		}
+		if in.ThreadID != "" {
+			if deps.Sessions == nil {
+				return TaskStartOutput{}, domain.ErrServiceUnavailable
+			}
+			if err := deps.Sessions.AuthorizeResume(ctx, in.WorkspaceID, in.ThreadID); err != nil {
+				return TaskStartOutput{}, err
+			}
+		}
+		task, approval, err := deps.Tasks.StartWrite(ctx, in.WorkspaceID, in.Prompt, in.ThreadID)
+		if err != nil {
+			return TaskStartOutput{}, err
+		}
+		output := taskStartDTO(task)
+		output.ApprovalID = approval.ID
+		return output, nil
+	})
+	register(server, deps, "codex_request_session_attach", "Request local one-time approval to attach a Codex CLI session from an untrusted workspace. Trusted workspaces can resume sessions without per-session attach approval.", false, false, false, func(ctx context.Context, in SessionAttachInput) (SessionAttachOutput, error) {
+		if len(in.ThreadID) == 0 || len(in.ThreadID) > 256 {
+			return SessionAttachOutput{}, domain.ErrInvalidInput
+		}
+		if deps.Sessions == nil {
+			return SessionAttachOutput{}, domain.ErrServiceUnavailable
+		}
+		request, err := deps.Sessions.RequestAttach(ctx, in.WorkspaceID, in.ThreadID)
+		if err != nil {
+			return SessionAttachOutput{}, err
+		}
+		return SessionAttachOutput{RequestID: request.ID, ThreadID: request.ThreadID, WorkspaceID: request.WorkspaceID, Status: request.Status, ExpiresAt: request.ExpiresAt.UnixMilli()}, nil
+	})
+	register(server, deps, "codex_request_session_project_binding", "Request local owner approval to bind a legacy Codex CLI thread to one repository selected from codex_list_session_projects. Approval is tied to the thread and filesystem identities, expires, and grants read-only session resume only; write approval remains per task.", false, false, false, func(ctx context.Context, in SessionProjectBindingInput) (SessionProjectBindingOutput, error) {
+		if deps.Sessions == nil || len(in.ThreadID) == 0 || len(in.ThreadID) > 256 || len(in.ProjectID) != 32 {
+			return SessionProjectBindingOutput{}, domain.ErrInvalidInput
+		}
+		binding, err := deps.Sessions.RequestProjectBinding(ctx, in.ThreadID, in.ProjectID)
+		if err != nil {
+			return SessionProjectBindingOutput{}, err
+		}
+		return SessionProjectBindingOutput{RequestID: binding.ID, ThreadID: binding.ThreadID, ProjectID: binding.ProjectID, Status: binding.Status, ExpiresAt: binding.ExpiresAt.UnixMilli()}, nil
+	})
+	register(server, deps, "codex_resume_thread", "Continue one explicit bridge-owned, individually attached, or trusted-root CLI thread. Workspace and thread IDs are required; repository sessions stay repository-scoped and sessions started at a trusted root get read-only access only within that root. The current sandbox is reapplied on every resume; root-scoped writes are denied and repository writes still require separate per-task approval.", false, false, false, func(ctx context.Context, in TaskResumeInput) (TaskStartOutput, error) {
 		if len(in.Prompt) > 64<<10 || len(in.ThreadID) == 0 || len(in.ThreadID) > 256 {
 			return TaskStartOutput{}, domain.ErrInvalidInput
+		}
+		if deps.Sessions == nil {
+			return TaskStartOutput{}, domain.ErrServiceUnavailable
+		}
+		if err := deps.Sessions.AuthorizeResume(ctx, in.WorkspaceID, in.ThreadID); err != nil {
+			return TaskStartOutput{}, err
 		}
 		task, err := deps.Tasks.Start(ctx, in.WorkspaceID, in.Prompt, in.ThreadID)
 		if err != nil {
@@ -358,7 +518,7 @@ func NewServer(deps Dependencies) *mcp.Server {
 		if _, ok := security.Authorize(ctx); !ok {
 			return CapabilitiesOutput{}, domain.ErrNotAuthorized
 		}
-		return CapabilitiesOutput{MCPTransport: "streamable-http", CodexTransport: "stdio-jsonl", Workspaces: "explicit-registration", CodexFilesystem: "workspace-confined-read-only; App Server >= 0.138.0", CodexNetwork: "sandboxed-command-network-disabled", CodexMCPServers: "disabled", PrivilegedExecution: "mock-only", SecureTunnel: "not-configured", ChatGPTConnection: "not-tested"}, nil
+		return CapabilitiesOutput{MCPTransport: "streamable-http", CodexTransport: "stdio-jsonl", Workspaces: "explicit-registration", CodexFilesystem: "read-only-by-default", WorkspaceWrite: "workspace-write after local per-task approval", CodexNetwork: "sandboxed-command-network-disabled", CodexMCPServers: "disabled", PrivilegedExecution: "mock-only", SecureTunnel: "not-configured", ChatGPTConnection: "not-tested"}, nil
 	})
 	return server
 }
@@ -491,6 +651,8 @@ func errorClass(err error) string {
 
 func auditIDs(value any) (string, string) {
 	switch input := value.(type) {
+	case SessionCatalogInput:
+		return input.WorkspaceID, ""
 	case WorkspaceIDInput:
 		return input.WorkspaceID, ""
 	case WorkspaceRegisterInput:
@@ -498,6 +660,8 @@ func auditIDs(value any) (string, string) {
 	case TaskStartInput:
 		return input.WorkspaceID, ""
 	case TaskResumeInput:
+		return input.WorkspaceID, ""
+	case TaskWriteInput:
 		return input.WorkspaceID, ""
 	case TaskIDInput:
 		return "", input.TaskID
@@ -508,14 +672,20 @@ func auditIDs(value any) (string, string) {
 
 func workspaceDTO(value domain.Workspace) WorkspaceDTO {
 	git := optionalString(value.GitRepository)
-	return WorkspaceDTO{ID: value.ID, RootPath: value.RootPath, AllowedDirectories: []string{value.RootPath}, DefaultModel: nil, SandboxPermissions: SandboxPermissionsDTO{Filesystem: "read-only", Network: false}, AllowedOperations: []string{"analysis"}, ApprovalRequirements: []string{"workspace-registration"}, MaxConcurrentTasks: 1, TimeoutMS: 20 * 60 * 1000, GitRepository: git, CreatedAt: value.CreatedAt.UnixMilli()}
+	filesystem, operations, approvals := "read-only", []string{"analysis"}, []string{"workspace-registration"}
+	if value.WriteEnabled {
+		filesystem = "workspace-write-after-approval"
+		operations = append(operations, "workspace-write")
+		approvals = append(approvals, "write-task")
+	}
+	return WorkspaceDTO{ID: value.ID, RootPath: value.RootPath, AllowedDirectories: []string{value.RootPath}, DefaultModel: nil, SandboxPermissions: SandboxPermissionsDTO{Filesystem: filesystem, Network: false}, AllowedOperations: operations, ApprovalRequirements: approvals, WriteEnabled: value.WriteEnabled, SessionTrusted: value.SessionTrusted, MaxConcurrentTasks: 1, TimeoutMS: 20 * 60 * 1000, GitRepository: git, CreatedAt: value.CreatedAt.UnixMilli()}
 }
 
 func taskStartDTO(task domain.Task) TaskStartOutput {
-	return TaskStartOutput{TaskID: task.ID, Status: task.Status, ThreadID: optionalString(task.ThreadID), CreatedAt: task.CreatedAt.UnixMilli()}
+	return TaskStartOutput{TaskID: task.ID, Status: task.Status, ThreadID: optionalString(task.ThreadID), ExecutionMode: task.ExecutionMode, CreatedAt: task.CreatedAt.UnixMilli()}
 }
 func taskDTO(task domain.Task) TaskDTO {
-	return TaskDTO{ID: task.ID, WorkspaceID: task.WorkspaceID, ThreadID: optionalString(task.ThreadID), TurnID: optionalString(task.TurnID), Status: task.Status, Progress: task.Progress, Result: task.Result, Diff: task.Diff, Error: task.Error, OutputExpired: task.OutputExpired, CreatedAt: task.CreatedAt.UnixMilli(), UpdatedAt: task.UpdatedAt.UnixMilli()}
+	return TaskDTO{ID: task.ID, WorkspaceID: task.WorkspaceID, ThreadID: optionalString(task.ThreadID), TurnID: optionalString(task.TurnID), Status: task.Status, ExecutionMode: task.ExecutionMode, Progress: task.Progress, Result: task.Result, Diff: task.Diff, Error: task.Error, OutputExpired: task.OutputExpired, CreatedAt: task.CreatedAt.UnixMilli(), UpdatedAt: task.UpdatedAt.UnixMilli()}
 }
 func optionalString(value string) *string {
 	if value == "" {
@@ -535,12 +705,21 @@ func inputSchema[In any]() any {
 		return map[string]any{"type": "object", "properties": map[string]any{}, "additionalProperties": false}
 	case WorkspaceIDInput:
 		return objectSchema(map[string]any{"workspaceId": stringSchema("Registered workspace identifier", 2, 63, `^[a-z][a-z0-9-]{1,62}$`)}, "workspaceId")
+	case SessionCatalogInput:
+		return objectSchema(map[string]any{
+			"workspaceId": stringSchema("Optional approved workspace ID filter", 0, 63, `^[a-z][a-z0-9-]{1,62}$`),
+			"search":      stringSchema("Optional Codex thread title search", 0, 200, ""),
+			"limit":       map[string]any{"type": "integer", "minimum": 1, "maximum": 50},
+			"cursor":      stringSchema("Opaque App Server cursor from the previous page", 0, 8192, ""),
+		})
 	case WorkspaceRegisterInput:
 		return objectSchema(map[string]any{"workspaceId": stringSchema("Requested workspace identifier", 2, 63, `^[a-z][a-z0-9-]{1,62}$`), "path": stringSchema("Absolute local directory path", 1, 4096, "")}, "workspaceId", "path")
 	case TaskStartInput:
 		return objectSchema(map[string]any{"workspaceId": stringSchema("Approved workspace identifier", 2, 63, `^[a-z][a-z0-9-]{1,62}$`), "prompt": stringSchema("Task prompt", 1, 20000, "")}, "workspaceId", "prompt")
 	case TaskResumeInput:
 		return objectSchema(map[string]any{"workspaceId": stringSchema("Approved workspace identifier", 2, 63, `^[a-z][a-z0-9-]{1,62}$`), "threadId": stringSchema("Bridge-owned thread identifier", 1, 256, ""), "prompt": stringSchema("Task prompt", 1, 20000, "")}, "workspaceId", "threadId", "prompt")
+	case TaskWriteInput:
+		return objectSchema(map[string]any{"workspaceId": stringSchema("Locally write-enabled workspace identifier", 2, 63, `^[a-z][a-z0-9-]{1,62}$`), "prompt": stringSchema("Task prompt requiring local one-time approval", 1, 20000, ""), "threadId": stringSchema("Optional bridge-owned thread identifier", 0, 256, "")}, "workspaceId", "prompt")
 	case TaskIDInput:
 		return objectSchema(map[string]any{"taskId": stringSchema("Task UUID", 36, 36, taskIDPattern.String())}, "taskId")
 	case ApprovalIDInput:
@@ -551,7 +730,11 @@ func inputSchema[In any]() any {
 }
 
 func objectSchema(properties map[string]any, required ...string) map[string]any {
-	return map[string]any{"type": "object", "properties": properties, "required": required, "additionalProperties": false}
+	schema := map[string]any{"type": "object", "properties": properties, "additionalProperties": false}
+	if len(required) > 0 {
+		schema["required"] = required
+	}
+	return schema
 }
 
 func stringSchema(description string, minimum, maximum int, pattern string) map[string]any {

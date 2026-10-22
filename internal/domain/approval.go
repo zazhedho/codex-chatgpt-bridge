@@ -26,3 +26,18 @@ type Approval struct {
 	ExpiresAt      time.Time
 	ConsumedAt     *time.Time
 }
+
+type WriteTaskApprovalParameters struct {
+	TaskID        string        `json:"taskId"`
+	WorkspaceID   string        `json:"workspaceId"`
+	ExecutionMode ExecutionMode `json:"executionMode"`
+	ThreadID      string        `json:"threadId,omitempty"`
+	Prompt        string        `json:"prompt"`
+}
+
+type ApprovedWriteTask struct {
+	TaskID    string
+	Workspace Workspace
+	Prompt    string
+	ThreadID  string
+}

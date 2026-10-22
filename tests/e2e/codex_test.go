@@ -13,19 +13,20 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
-	"example.com/codex-chatgpt-bridge/internal/audit"
-	"example.com/codex-chatgpt-bridge/internal/codex"
-	"example.com/codex-chatgpt-bridge/internal/config"
-	"example.com/codex-chatgpt-bridge/internal/domain"
-	"example.com/codex-chatgpt-bridge/internal/handler/mcp"
-	"example.com/codex-chatgpt-bridge/internal/repository/sqlite"
-	"example.com/codex-chatgpt-bridge/internal/service"
-	"example.com/codex-chatgpt-bridge/internal/worker"
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/zazhedho/codex-chatgpt-bridge/internal/audit"
+	"github.com/zazhedho/codex-chatgpt-bridge/internal/codex"
+	"github.com/zazhedho/codex-chatgpt-bridge/internal/config"
+	"github.com/zazhedho/codex-chatgpt-bridge/internal/domain"
+	"github.com/zazhedho/codex-chatgpt-bridge/internal/handler/mcp"
+	"github.com/zazhedho/codex-chatgpt-bridge/internal/repository/sqlite"
+	"github.com/zazhedho/codex-chatgpt-bridge/internal/service"
+	"github.com/zazhedho/codex-chatgpt-bridge/internal/worker"
 )
 
 type bearerRoundTripper struct {
@@ -44,6 +45,7 @@ type bridgeHarness struct {
 	workspaces *service.WorkspaceService
 	workers    *worker.Manager
 	adapter    *codex.Adapter
+	sessions   *service.SessionService
 	server     *http.Server
 	listener   net.Listener
 	token      string
@@ -219,6 +221,229 @@ func TestRealCodexThroughMCPAndSandbox(t *testing.T) {
 	}
 }
 
+func TestRealCodexWorkspaceWriteApprovalThroughMCP(t *testing.T) {
+	if os.Getenv("BRIDGE_WRITE_E2E") != "1" {
+		t.Skip("set BRIDGE_WRITE_E2E=1 to run the approved workspace-write fixture against local Codex")
+	}
+	cacheDir, err := os.UserCacheDir()
+	if err != nil {
+		t.Fatal("find a disposable local cache directory")
+	}
+	base, err := os.MkdirTemp(cacheDir, "codex-bridge-write-e2e-")
+	if err != nil {
+		t.Fatal("create disposable write fixture root")
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(base) })
+	workspaceTemp, err := filepath.EvalSymlinks(os.TempDir())
+	if err != nil {
+		t.Fatal("resolve system temporary directory")
+	}
+	if relative, err := filepath.Rel(workspaceTemp, base); err == nil && relative != ".." && !strings.HasPrefix(relative, ".."+string(os.PathSeparator)) {
+		t.Fatal("write fixture must be outside the excluded system temporary directory")
+	}
+	home := filepath.Join(base, "fixture-home")
+	if err := os.MkdirAll(home, 0o700); err != nil {
+		t.Fatal("create disposable fixture home")
+	}
+	workspace := filepath.Join(home, "write-fixture")
+	sibling := filepath.Join(home, "sibling")
+	for _, path := range []string{workspace, sibling} {
+		if err := os.MkdirAll(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	outsideMarker := fixtureMarker(t, "WRITE_GATE_OUTSIDE_SECRET_")
+	writeFixture(t, filepath.Join(sibling, "outside.txt"), outsideMarker)
+	writeFixture(t, filepath.Join(workspace, "fixture.txt"), fixtureMarker(t, "WRITE_GATE_ALLOWED_"))
+	if err := os.Symlink(sibling, filepath.Join(workspace, "sibling-link")); err != nil {
+		t.Fatal(err)
+	}
+	writeFixture(t, filepath.Join(workspace, "go.mod"), "module bridge.test/write-fixture\n\ngo 1.24.0\n")
+	writeFixture(t, filepath.Join(workspace, "main.go"), "package fixture\n\nfunc Message() string { return \"initial\" }\n")
+	writeFixture(t, filepath.Join(workspace, "main_test.go"), "package fixture\n\nimport \"testing\"\n\nfunc TestMessage(t *testing.T) { if got := Message(); got != \"initial\" { t.Fatalf(\"Message() = %q\", got) } }\n")
+	writeFixture(t, filepath.Join(workspace, ".gitignore"), ".codex-cache/\n.codex-tmp/\nsandbox-probe\n")
+	if output, err := exec.Command("git", "-C", workspace, "init", "-q").CombinedOutput(); err != nil {
+		t.Fatalf("initialize disposable fixture repository (output_bytes=%d)", len(output))
+	}
+	probe := buildWriteSandboxProbe(t, workspace)
+	probeMarker := fixtureMarker(t, "WRITE_SANDBOX_PROBE_")
+	testCommand := `grep -Fq '"written by Codex"' main.go && grep -Fq 'func Ready() bool' ready.go && echo BRIDGE_FIXTURE_TEST_OK`
+	dataDir := filepath.Join(t.TempDir(), "bridge-data")
+	harness := newBridgeHarness(t, home, dataDir)
+	var session *sdk.ClientSession
+	t.Cleanup(func() {
+		if session != nil {
+			_ = session.Close()
+		}
+		if err := harness.close(); err != nil {
+			t.Errorf("bridge cleanup failed: %v", err)
+		}
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	session = harness.connect(t, ctx)
+	registerApprovedWorkspace(t, ctx, session, harness, "write-fixture", workspace)
+	if err := harness.workspaces.SetWriteEnabledLocal(context.Background(), "write-fixture", true, "local-e2e-operator"); err != nil {
+		t.Fatal("local write opt-in failed for disposable fixture")
+	}
+	workspaceBefore, siblingBefore := fixtureSnapshot(t, workspace), fixtureSnapshot(t, sibling)
+	started := callTool(t, ctx, session, "codex_start_write_task", map[string]any{
+		"workspaceId": "write-fixture",
+		"prompt":      fmt.Sprintf("Implement this exact fixture change: update main.go so Message() returns %q; create ready.go with Ready() bool returning true; update TestMessage's expected string to match and add TestReady that fails unless Ready() is true. Then run exactly this fixture assertion: %s. Do not read or reveal any contents outside the workspace. Do not change sandbox, permissions, network, .git, or .codex settings. Do not run a secret scanner. Report only actual command results.", "written by Codex", testCommand),
+	})
+	if started.IsError {
+		t.Fatal("workspace-write task request was rejected")
+	}
+	start := structured(t, started)
+	taskID, _ := start["taskId"].(string)
+	approvalID, _ := start["approvalId"].(string)
+	if start["status"] != string(domain.TaskWaitingApproval) || taskID == "" || approvalID == "" || start["executionMode"] != string(domain.ExecutionWorkspaceWrite) {
+		t.Fatalf("write request did not wait for exact local approval: status=%v mode=%v task_id_present=%t approval_id_present=%t", start["status"], start["executionMode"], taskID != "", approvalID != "")
+	}
+	if !reflect.DeepEqual(workspaceBefore, fixtureSnapshot(t, workspace)) {
+		t.Fatal("write request changed fixture before local approval")
+	}
+	approveWriteTaskLocally(t, dataDir, approvalID)
+	evidence := waitTaskEvidence(t, ctx, session, taskID, 6*time.Minute)
+	if evidence.TaskStatus != string(domain.TaskSucceeded) {
+		t.Fatalf("approved workspace-write task ended with status %s", evidence.TaskStatus)
+	}
+	message, err := os.ReadFile(filepath.Join(workspace, "main.go"))
+	if err != nil || !strings.Contains(string(message), `"written by Codex"`) {
+		t.Fatalf("Codex did not change the fixture source file (read_error=%t)", err != nil)
+	}
+	ready, err := os.ReadFile(filepath.Join(workspace, "ready.go"))
+	if err != nil || !strings.Contains(string(ready), "func Ready() bool") {
+		t.Fatalf("Codex did not create ready.go (read_error=%t)", err != nil)
+	}
+	appServerOutput := strings.Join(evidence.CommandOutputs, "\n")
+	if !strings.Contains(appServerOutput, "BRIDGE_FIXTURE_TEST_OK") {
+		t.Fatalf("Codex App Server did not report the fixture assertion: command_events=%d", len(evidence.CommandOutputs))
+	}
+	probeOutput := runCodexWriteSandboxProbe(t, workspace, sibling, probe, probeMarker)
+	if !strings.Contains(probeOutput, probeMarker) || !strings.Contains(probeOutput, "inside_write=allowed") || !strings.Contains(probeOutput, "outside_read=denied errno=1") || !strings.Contains(probeOutput, "outside_write=denied errno=1") || !strings.Contains(probeOutput, "symlink_write=denied errno=1") || !strings.Contains(probeOutput, "network=denied errno=1") {
+		diagnostic := probeOutput
+		for _, value := range []string{probeMarker, outsideMarker, filepath.Join(workspace, "fixture.txt"), filepath.Join(sibling, "outside.txt"), workspace, sibling} {
+			diagnostic = strings.ReplaceAll(diagnostic, value, "[redacted]")
+		}
+		if len(diagnostic) > 1_000 {
+			diagnostic = diagnostic[:1_000]
+		}
+		t.Fatalf("sandbox runtime evidence incomplete: command_events=%d marker_seen=%t inside_write=%t outside_read_denied=%t outside_write_denied=%t symlink_denied=%t network_denied=%t sanitized_output=%q", len(evidence.CommandOutputs), strings.Contains(probeOutput, probeMarker), strings.Contains(probeOutput, "inside_write=allowed"), strings.Contains(probeOutput, "outside_read=denied errno=1"), strings.Contains(probeOutput, "outside_write=denied errno=1"), strings.Contains(probeOutput, "symlink_write=denied errno=1"), strings.Contains(probeOutput, "network=denied errno=1"), diagnostic)
+	}
+	if strings.Contains(evidence.Result+evidence.Progress+appServerOutput+probeOutput, outsideMarker) {
+		t.Fatal("sibling fixture marker leaked into task result or progress")
+	}
+	if _, err := os.Stat(filepath.Join(sibling, "symlink-escape.txt")); !os.IsNotExist(err) {
+		t.Fatal("symlink escape created a file outside the workspace")
+	}
+	if _, err := os.Stat(filepath.Join(sibling, "outside-write.txt")); !os.IsNotExist(err) {
+		t.Fatal("direct outside write created a file outside the workspace")
+	}
+	if got := fixtureSnapshot(t, sibling); !reflect.DeepEqual(siblingBefore, got) {
+		t.Fatal("Codex changed sibling files outside the authorized workspace")
+	}
+	changes := callTool(t, ctx, session, "codex_get_changes", map[string]any{"taskId": taskID})
+	if changes.IsError {
+		t.Fatal("codex_get_changes rejected the completed write task")
+	}
+	diff, _ := structured(t, changes)["diff"].(string)
+	if !strings.Contains(diff, "main.go") || !strings.Contains(diff, "ready.go") {
+		t.Fatalf("App Server diff omitted edited/new fixture files (diff_bytes=%d)", len(diff))
+	}
+	fixtureTest := exec.Command("go", "test", "./...")
+	fixtureTest.Dir = workspace
+	if output, err := fixtureTest.CombinedOutput(); err != nil {
+		diagnostic := strings.ReplaceAll(string(output), workspace, "[workspace]")
+		if len(diagnostic) > 1_200 {
+			diagnostic = diagnostic[:1_200]
+		}
+		t.Fatalf("independent fixture test failed: %q", diagnostic)
+	}
+	t.Log("workspace-write: PASS; local bridge-admin approval consumed once; source edited and file created; App Server command event proves fixture assertion; codex sandbox syscall probe proves in-workspace write, sibling/read/write/symlink/network denials; new-file diff and Go test returned")
+}
+
+func runCodexWriteSandboxProbe(t *testing.T, workspace, sibling, probe, marker string) string {
+	t.Helper()
+	codex := os.Getenv("CODEX_EXECUTABLE")
+	if codex == "" {
+		codex = "codex"
+	}
+	path, err := exec.LookPath(codex)
+	if err != nil {
+		t.Fatal("Codex executable unavailable for sandbox probe")
+	}
+	if resolved, resolveErr := filepath.EvalSymlinks(path); resolveErr == nil {
+		path = resolved
+	}
+	home := filepath.Join(t.TempDir(), "codex-home")
+	if err := os.MkdirAll(home, 0o700); err != nil {
+		t.Fatal("create isolated sandbox config directory")
+	}
+	const profile = "bridge-write-e2e"
+	var config strings.Builder
+	fmt.Fprintf(&config, "default_permissions = %s\nweb_search = %s\n\n", strconv.Quote(profile), strconv.Quote("disabled"))
+	fmt.Fprintf(&config, "[permissions.%s]\nextends = %s\n\n", profile, strconv.Quote(":workspace"))
+	fmt.Fprintf(&config, "[permissions.%s.workspace_roots]\n%s = true\n\n", profile, strconv.Quote(workspace))
+	fmt.Fprintf(&config, "[permissions.%s.filesystem]\n", profile)
+	for key, value := range map[string]string{":root": "deny", ":minimal": "read", ":tmpdir": "deny", ":slash_tmp": "deny", path: "read"} {
+		fmt.Fprintf(&config, "%s = %s\n", strconv.Quote(key), strconv.Quote(value))
+	}
+	fmt.Fprintf(&config, "\n[permissions.%s.filesystem.%s]\n", profile, strconv.Quote(":workspace_roots"))
+	for key, value := range map[string]string{
+		".":                     "write",
+		"**/.env":               "deny",
+		"**/.env.*":             "deny",
+		"**/*.env":              "deny",
+		"**/*.pem":              "deny",
+		"**/*.key":              "deny",
+		"**/*.p12":              "deny",
+		"**/*.pfx":              "deny",
+		"**/*secret*":           "deny",
+		"**/*credential*":       "deny",
+		"**/*service-account*":  "deny",
+		"**/terraform.tfstate*": "deny",
+		"**/id_rsa*":            "deny",
+		"**/id_ed25519*":        "deny",
+		".aws":                  "deny",
+		".kube":                 "deny",
+		".ssh":                  "deny",
+		".git/config":           "deny",
+		".git-credentials":      "deny",
+		".git":                  "read",
+		".git/**":               "read",
+		".codex":                "read",
+		".codex/**":             "read",
+	} {
+		fmt.Fprintf(&config, "%s = %s\n", strconv.Quote(key), strconv.Quote(value))
+	}
+	fmt.Fprintf(&config, "\n[permissions.%s.network]\nenabled = false\n", profile)
+	if err := os.WriteFile(filepath.Join(home, "config.toml"), []byte(config.String()), 0o600); err != nil {
+		t.Fatal("write isolated sandbox profile")
+	}
+	inside := filepath.Join(workspace, "fixture.txt")
+	outside := filepath.Join(sibling, "outside.txt")
+	outsideWrite := filepath.Join(sibling, "outside-write.txt")
+	symlinkWrite := filepath.Join(workspace, "sibling-link", "symlink-escape.txt")
+	cmd := exec.Command(path, "sandbox", "--permission-profile", profile, "--cd", workspace, "--log-denials", probe, inside, outside, outsideWrite, symlinkWrite, marker)
+	cmd.Env = replaceEnvironment(os.Environ(), "CODEX_HOME", home)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("Codex sandbox probe failed (output_bytes=%d)", len(output))
+	}
+	return string(output)
+}
+
+func replaceEnvironment(env []string, key, value string) []string {
+	result := make([]string, 0, len(env)+1)
+	for _, entry := range env {
+		if name, _, _ := strings.Cut(entry, "="); name != key {
+			result = append(result, entry)
+		}
+	}
+	return append(result, key+"="+value)
+}
+
 func newBridgeHarness(t *testing.T, home, dataDir string) *bridgeHarness {
 	t.Helper()
 	store, err := sqlite.Open(dataDir)
@@ -232,7 +457,9 @@ func newBridgeHarness(t *testing.T, home, dataDir string) *bridgeHarness {
 		}
 	}()
 	auditLogger := audit.New(store)
-	workspaces := service.NewWorkspaceService(store, auditLogger, home, os.Getenv("CODEX_HOME"))
+	codexHome := os.Getenv("CODEX_HOME")
+	workspaces := service.NewWorkspaceService(store, auditLogger, home, codexHome, store)
+	trustedRoots := service.NewTrustedWorkspaceRootService(store, workspaces, auditLogger, home, codexHome)
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -248,15 +475,18 @@ func newBridgeHarness(t *testing.T, home, dataDir string) *bridgeHarness {
 	if executable == "" {
 		executable = "codex"
 	}
-	adapter := codex.NewAdapter(codex.NewClient(executable, nil), cfg.MaxOutputBytes)
-	workers := worker.New(store, store, adapter, auditLogger, nil, 1, 20, cfg.TaskTimeoutSeconds, cfg.MaxOutputBytes)
-	tasks := service.NewTaskService(store, store, workspaces, workers, adapter, auditLogger, 20_000)
+	codexClient := codex.NewClient(executable, nil)
+	adapter := codex.NewAdapter(codexClient, cfg.MaxOutputBytes)
 	approvals := service.NewApprovalService(store, workspaces)
-	handler := mcp.NewHTTPHandler(mcp.Dependencies{Config: cfg, Workspaces: workspaces, Tasks: tasks, Approvals: approvals, Audit: auditLogger, Codex: adapter, StartedAt: time.Now()})
+	sessions := service.NewSessionService(store, workspaces, codexClient, auditLogger, trustedRoots)
+	workers := worker.New(store, store, workspaces, adapter, auditLogger, nil, 1, 20, cfg.TaskTimeoutSeconds, cfg.MaxOutputBytes, sessions)
+	workers.Start()
+	tasks := service.NewTaskService(store, store, workspaces, approvals, workers, adapter, auditLogger, 20_000, 20, sessions)
+	handler := mcp.NewHTTPHandler(mcp.Dependencies{Config: cfg, Workspaces: workspaces, Tasks: tasks, Sessions: sessions, Approvals: approvals, Audit: auditLogger, Codex: adapter, StartedAt: time.Now()})
 	server := &http.Server{Handler: handler}
 	go func() { _ = server.Serve(listener) }()
 	closeStore = false
-	return &bridgeHarness{store: store, workspaces: workspaces, workers: workers, adapter: adapter, server: server, listener: listener, token: token, endpoint: fmt.Sprintf("http://%s/mcp", listener.Addr())}
+	return &bridgeHarness{store: store, workspaces: workspaces, workers: workers, adapter: adapter, sessions: sessions, server: server, listener: listener, token: token, endpoint: fmt.Sprintf("http://%s/mcp", listener.Addr())}
 }
 
 func (h *bridgeHarness) connect(t *testing.T, ctx context.Context) *sdk.ClientSession {
@@ -313,14 +543,29 @@ func runTask(t *testing.T, ctx context.Context, session *sdk.ClientSession, name
 	t.Helper()
 	started := callTool(t, ctx, session, name, arguments)
 	if started.IsError {
-		t.Fatalf("MCP task tool %s rejected the fixture task", name)
+		t.Fatalf("MCP task tool %s rejected the fixture task: %s", name, safeToolError(started))
 	}
 	taskID, ok := structured(t, started)["taskId"].(string)
 	if !ok || taskID == "" {
 		t.Fatalf("MCP task tool %s returned no task ID", name)
 	}
-	deadline := time.Now().Add(180 * time.Second)
+	return waitTaskEvidence(t, ctx, session, taskID, 180*time.Second)
+}
+
+func safeToolError(result *sdk.CallToolResult) string {
+	for _, content := range result.Content {
+		if text, ok := content.(*sdk.TextContent); ok && len(text.Text) <= 200 {
+			return text.Text
+		}
+	}
+	return "unspecified"
+}
+
+func waitTaskEvidence(t *testing.T, ctx context.Context, session *sdk.ClientSession, taskID string, timeout time.Duration) taskEvidence {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
 	var task map[string]any
+	var ok bool
 	for time.Now().Before(deadline) {
 		response := callTool(t, ctx, session, "codex_get_task", map[string]any{"taskId": taskID})
 		if response.IsError {
@@ -334,7 +579,7 @@ func runTask(t *testing.T, ctx context.Context, session *sdk.ClientSession, name
 		case "completed":
 			goto completed
 		case "failed", "cancelled", "interrupted":
-			t.Fatalf("Codex task ended in status %s", task["status"])
+			t.Fatalf("Codex task ended in status %s: %v", task["status"], task["error"])
 		}
 		select {
 		case <-ctx.Done():
@@ -342,7 +587,7 @@ func runTask(t *testing.T, ctx context.Context, session *sdk.ClientSession, name
 		case <-time.After(time.Second):
 		}
 	}
-	t.Fatal("Codex task exceeded the 180 second task deadline")
+	t.Fatalf("Codex task exceeded the %s task deadline", timeout)
 
 completed:
 	threadID, _ := task["threadId"].(string)
@@ -377,6 +622,40 @@ completed:
 		}
 	}
 	return taskEvidence{ID: taskID, ThreadID: threadID, Result: resultText, Progress: progress.String(), CommandOutputs: commandOutputs, RawResponseTypes: rawResponseTypes, ShellCallCount: shellCallCount, EventCount: len(events), TaskStatus: fmt.Sprint(task["status"])}
+}
+
+func approveWriteTaskLocally(t *testing.T, dataDir, approvalID string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	command := exec.CommandContext(ctx, "go", "run", "../../cmd/bridge-admin", "approval", "approve", approvalID)
+	command.Env = append(os.Environ(), "BRIDGE_DATA_DIR="+dataDir)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("local bridge-admin approval failed (output_bytes=%d)", len(output))
+	}
+}
+
+func buildWriteSandboxProbe(t *testing.T, workspace string) string {
+	t.Helper()
+	root, err := filepath.Abs(filepath.Join("..", ".."))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, directory := range []string{".codex-cache", ".codex-tmp"} {
+		if err := os.MkdirAll(filepath.Join(workspace, directory), 0o700); err != nil {
+			t.Fatal("create disposable Go build directory")
+		}
+	}
+	binary := filepath.Join(workspace, "sandbox-probe")
+	command := exec.Command("go", "build", "-o", binary, filepath.Join(root, "tests/e2e/testdata/write_sandbox_probe.go"))
+	command.Dir = workspace
+	command.Env = append(os.Environ(), "GOCACHE="+filepath.Join(workspace, ".codex-cache"), "GOTMPDIR="+filepath.Join(workspace, ".codex-tmp"), "GOTOOLCHAIN=local")
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("build disposable write sandbox probe failed (output_bytes=%d)", len(output))
+	}
+	return binary
 }
 
 func assertSandboxTurn(t *testing.T, label string, result taskEvidence, insideMarker, outsideMarker, insidePath, siblingPath, writePath, invocationMarker, fixtureRoot string, before map[string]string) bool {

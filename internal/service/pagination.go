@@ -1,6 +1,6 @@
 package service
 
-import "example.com/codex-chatgpt-bridge/internal/domain"
+import "github.com/zazhedho/codex-chatgpt-bridge/internal/domain"
 
 const defaultPageLimit = 10
 const maxPageOffset = 100_000

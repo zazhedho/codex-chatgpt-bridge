@@ -9,8 +9,8 @@ import (
 	"strings"
 	"time"
 
-	"example.com/codex-chatgpt-bridge/internal/domain"
-	"example.com/codex-chatgpt-bridge/internal/security"
+	"github.com/zazhedho/codex-chatgpt-bridge/internal/domain"
+	"github.com/zazhedho/codex-chatgpt-bridge/internal/security"
 )
 
 type ApprovalRepository interface {
@@ -18,6 +18,7 @@ type ApprovalRepository interface {
 	ListPendingApprovalsPage(context.Context, time.Time, int, int) ([]domain.Approval, bool, error)
 	GetApproval(context.Context, string) (domain.Approval, error)
 	InsertApproval(context.Context, domain.Approval, string) error
+	CreateWriteTaskApproval(context.Context, domain.Task, domain.Approval, int) error
 	ApproveApproval(context.Context, string, string, time.Time) (domain.Approval, error)
 	RejectApproval(context.Context, string, time.Time) error
 	ConsumeApproval(context.Context, string, string, string, time.Time) (domain.Approval, error)
@@ -48,6 +49,32 @@ type ApprovalActor struct{ Channel, Subject string }
 
 // CreatePending records an internal operation request; it does not execute the operation.
 func (s *ApprovalService) CreatePending(ctx context.Context, input ApprovalInput) (domain.Approval, error) {
+	approval, err := s.prepare(input)
+	if err != nil {
+		return domain.Approval{}, err
+	}
+	if err := s.repo.InsertApproval(ctx, approval, input.TaskID); err != nil {
+		return domain.Approval{}, err
+	}
+	return approval, nil
+}
+
+func (s *ApprovalService) CreateWriteTaskApproval(ctx context.Context, task domain.Task, prompt string, maxPending int) (domain.Approval, error) {
+	if task.Status != domain.TaskWaitingApproval || task.ExecutionMode != domain.ExecutionWorkspaceWrite || task.WorkspaceID == "" || task.PromptHash == "" || maxPending < 1 {
+		return domain.Approval{}, domain.ErrInvalidInput
+	}
+	parameters := domain.WriteTaskApprovalParameters{TaskID: task.ID, WorkspaceID: task.WorkspaceID, ExecutionMode: task.ExecutionMode, ThreadID: task.ThreadID, Prompt: prompt}
+	approval, err := s.prepare(ApprovalInput{WorkspaceID: task.WorkspaceID, TaskID: task.ID, OperationType: "codex.workspace-write", TargetResource: task.WorkspaceID, Parameters: parameters})
+	if err != nil {
+		return domain.Approval{}, err
+	}
+	if err := s.repo.CreateWriteTaskApproval(ctx, task, approval, maxPending); err != nil {
+		return domain.Approval{}, err
+	}
+	return approval, nil
+}
+
+func (s *ApprovalService) prepare(input ApprovalInput) (domain.Approval, error) {
 	if input.OperationType == "" || len(input.OperationType) > 128 || input.TargetResource == "" || len(input.TargetResource) > 4096 {
 		return domain.Approval{}, domain.ErrInvalidInput
 	}
@@ -74,9 +101,6 @@ func (s *ApprovalService) CreatePending(ctx context.Context, input ApprovalInput
 		artifactHash = hex.EncodeToString(digest[:])
 	}
 	approval := domain.Approval{ID: id, WorkspaceID: input.WorkspaceID, OperationType: input.OperationType, TargetResource: input.TargetResource, ParametersJSON: string(parameters), ParametersHash: hex.EncodeToString(parameterHash[:]), ArtifactHash: artifactHash, Status: domain.ApprovalPending, CreatedAt: created, ExpiresAt: created.Add(expiresIn)}
-	if err := s.repo.InsertApproval(ctx, approval, input.TaskID); err != nil {
-		return domain.Approval{}, err
-	}
 	return approval, nil
 }
 

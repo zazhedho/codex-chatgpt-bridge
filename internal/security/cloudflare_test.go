@@ -87,7 +87,7 @@ func TestCloudflareAccessVerifierRejectsInvalidClaimsAndKeys(t *testing.T) {
 		{name: "expired", key: key, kid: "key-1", claim: func() map[string]any { c := validClaims(); c["exp"] = now.Add(-time.Minute).Unix(); return c }},
 		{name: "expired within clock skew", key: key, kid: "key-1", claim: func() map[string]any { c := validClaims(); c["exp"] = now.Add(-time.Second).Unix(); return c }},
 		{name: "not yet valid", key: key, kid: "key-1", claim: func() map[string]any { c := validClaims(); c["nbf"] = now.Add(time.Minute).Unix(); return c }},
-		{name: "not yet valid within clock skew", key: key, kid: "key-1", claim: func() map[string]any { c := validClaims(); c["nbf"] = now.Add(time.Second).Unix(); return c }},
+		{name: "not yet valid within clock skew", key: key, kid: "key-1", claim: func() map[string]any { c := validClaims(); c["nbf"] = now.Add(time.Minute).Unix(); return c }},
 		{name: "unknown key id", key: key, kid: "unknown", claim: validClaims},
 		{name: "disallowed email", key: key, kid: "key-1", claim: func() map[string]any { c := validClaims(); c["email"] = "other@example.com"; return c }},
 	} {

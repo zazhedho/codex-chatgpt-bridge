@@ -7,12 +7,12 @@ import (
 	"fmt"
 	"time"
 
-	"example.com/codex-chatgpt-bridge/internal/domain"
+	"github.com/zazhedho/codex-chatgpt-bridge/internal/domain"
 	modernsqlite "modernc.org/sqlite"
 )
 
 func (s *Store) ListWorkspaces(ctx context.Context) ([]domain.Workspace, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, root_path, root_device, root_inode, created_at, git_repository FROM workspaces ORDER BY id`)
+	rows, err := s.db.QueryContext(ctx, `SELECT id, root_path, root_device, root_inode, created_at, git_repository, write_enabled, session_trusted, COALESCE(trusted_root_id,''), root_session_only FROM workspaces ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
@@ -21,7 +21,7 @@ func (s *Store) ListWorkspaces(ctx context.Context) ([]domain.Workspace, error) 
 	for rows.Next() {
 		var w domain.Workspace
 		var created int64
-		if err := rows.Scan(&w.ID, &w.RootPath, &w.RootDevice, &w.RootInode, &created, &w.GitRepository); err != nil {
+		if err := rows.Scan(&w.ID, &w.RootPath, &w.RootDevice, &w.RootInode, &created, &w.GitRepository, &w.WriteEnabled, &w.SessionTrusted, &w.TrustedRootID, &w.RootSessionOnly); err != nil {
 			return nil, err
 		}
 		w.CreatedAt = time.UnixMilli(created).UTC()
@@ -31,7 +31,7 @@ func (s *Store) ListWorkspaces(ctx context.Context) ([]domain.Workspace, error) 
 }
 
 func (s *Store) ListWorkspacesPage(ctx context.Context, limit, offset int) ([]domain.Workspace, bool, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, root_path, root_device, root_inode, created_at, git_repository FROM workspaces ORDER BY id LIMIT ? OFFSET ?`, limit+1, offset)
+	rows, err := s.db.QueryContext(ctx, `SELECT id, root_path, root_device, root_inode, created_at, git_repository, write_enabled, session_trusted, COALESCE(trusted_root_id,''), root_session_only FROM workspaces ORDER BY id LIMIT ? OFFSET ?`, limit+1, offset)
 	if err != nil {
 		return nil, false, err
 	}
@@ -43,7 +43,7 @@ func (s *Store) ListWorkspacesPage(ctx context.Context, limit, offset int) ([]do
 		}
 		var w domain.Workspace
 		var created int64
-		if err := rows.Scan(&w.ID, &w.RootPath, &w.RootDevice, &w.RootInode, &created, &w.GitRepository); err != nil {
+		if err := rows.Scan(&w.ID, &w.RootPath, &w.RootDevice, &w.RootInode, &created, &w.GitRepository, &w.WriteEnabled, &w.SessionTrusted, &w.TrustedRootID, &w.RootSessionOnly); err != nil {
 			return nil, false, err
 		}
 		w.CreatedAt = time.UnixMilli(created).UTC()
@@ -68,8 +68,8 @@ func (s *Store) HasWorkspaceConflict(ctx context.Context, id, rootPath string, n
 func (s *Store) GetWorkspace(ctx context.Context, id string) (domain.Workspace, error) {
 	var w domain.Workspace
 	var created int64
-	err := s.db.QueryRowContext(ctx, `SELECT id, root_path, root_device, root_inode, created_at, git_repository FROM workspaces WHERE id = ?`, id).
-		Scan(&w.ID, &w.RootPath, &w.RootDevice, &w.RootInode, &created, &w.GitRepository)
+	err := s.db.QueryRowContext(ctx, `SELECT id, root_path, root_device, root_inode, created_at, git_repository, write_enabled, session_trusted, COALESCE(trusted_root_id,''), root_session_only FROM workspaces WHERE id = ?`, id).
+		Scan(&w.ID, &w.RootPath, &w.RootDevice, &w.RootInode, &created, &w.GitRepository, &w.WriteEnabled, &w.SessionTrusted, &w.TrustedRootID, &w.RootSessionOnly)
 	if errors.Is(err, sql.ErrNoRows) {
 		return domain.Workspace{}, domain.ErrNotFound
 	}
@@ -78,6 +78,64 @@ func (s *Store) GetWorkspace(ctx context.Context, id string) (domain.Workspace, 
 	}
 	w.CreatedAt = time.UnixMilli(created).UTC()
 	return w, nil
+}
+
+func (s *Store) GetWorkspaceByRootPath(ctx context.Context, rootPath string) (domain.Workspace, error) {
+	return scanWorkspace(s.db.QueryRowContext(ctx, `SELECT id, root_path, root_device, root_inode, created_at, git_repository, write_enabled, session_trusted, COALESCE(trusted_root_id,''), root_session_only FROM workspaces WHERE root_path=?`, rootPath))
+}
+
+func (s *Store) SetWorkspaceSessionTrusted(ctx context.Context, workspace domain.Workspace, trusted bool) error {
+	result, err := s.db.ExecContext(ctx, `UPDATE workspaces SET session_trusted=? WHERE id=? AND root_path=? AND root_device=? AND root_inode=? AND (?=0 OR root_session_only=0)`,
+		trusted, workspace.ID, workspace.RootPath, workspace.RootDevice, workspace.RootInode, trusted)
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows != 1 {
+		return domain.ErrConflict
+	}
+	return s.secureFiles()
+}
+
+func (s *Store) SetWorkspaceWriteEnabled(ctx context.Context, id string, enabled bool) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if !enabled {
+		var running int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM tasks WHERE workspace_id=? AND execution_mode='workspace-write' AND status='running'`, id).Scan(&running); err != nil {
+			return err
+		}
+		if running != 0 {
+			return domain.ErrConflict
+		}
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE workspaces SET write_enabled=? WHERE id=?`, enabled, id)
+	if err != nil {
+		return err
+	}
+	rows, _ := result.RowsAffected()
+	if rows != 1 {
+		return domain.ErrNotFound
+	}
+	if !enabled {
+		now := time.Now().UnixMilli()
+		if _, err := tx.ExecContext(ctx, `UPDATE approvals SET status='rejected', parameters_json='{}', decided_at=? WHERE workspace_id=? AND operation='codex.workspace-write' AND status IN ('pending','approved')`, now, id); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE tasks SET status='cancelled', error='Workspace write mode was disabled', updated_at=? WHERE workspace_id=? AND execution_mode='workspace-write' AND status IN ('waiting_approval','queued')`, now, id); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	return s.secureFiles()
 }
 
 func (s *Store) InsertWorkspaceRequest(ctx context.Context, request domain.WorkspaceRequest) error {

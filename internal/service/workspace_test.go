@@ -11,10 +11,10 @@ import (
 	"testing"
 	"time"
 
-	"example.com/codex-chatgpt-bridge/internal/audit"
-	"example.com/codex-chatgpt-bridge/internal/domain"
-	"example.com/codex-chatgpt-bridge/internal/repository/sqlite"
-	"example.com/codex-chatgpt-bridge/internal/security"
+	"github.com/zazhedho/codex-chatgpt-bridge/internal/audit"
+	"github.com/zazhedho/codex-chatgpt-bridge/internal/domain"
+	"github.com/zazhedho/codex-chatgpt-bridge/internal/repository/sqlite"
+	"github.com/zazhedho/codex-chatgpt-bridge/internal/security"
 )
 
 func authorizedContext(token string) context.Context {

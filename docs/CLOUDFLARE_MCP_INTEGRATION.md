@@ -1,14 +1,14 @@
 # Cloudflare Access + ChatGPT MCP
 
-Status: local Cloudflare JWT auth is implemented and tested. Keep account-specific tunnel IDs, hostnames, AUD tags, and identities out of this repository. Verify live Cloudflare and ChatGPT state separately before use; this runbook does not certify account billing or connector readiness.
+Status as of 2026-10-20: Cloudflare Access/Tunnel OAuth and read-only ChatGPT MCP calls were previously verified for this deployment. The workspace-write tool still requires a ChatGPT tool refresh and an end-to-end write check. This runbook does not certify account billing or plan eligibility. Keep account-specific tunnel IDs, hostnames, AUD tags, and identities out of this repository.
 
 ## Cost and compatibility
 
 - Cloudflare's Zero Trust Free plan is listed at $0 for up to 50 users. Cloudflare currently includes 1,000 tunnels per account; additional capacity is paid. Check the account usage page before creating anything. Do not select a paid capacity option.
 - Cloudflare documents Managed OAuth for self-hosted and MCP Access applications. Its coding-agent documentation shows authorization code + PKCE S256, dynamic client registration, public-client token auth (`none`), refresh tokens, and RFC 8707 `resource`. The docs do not state plan-specific Managed OAuth billing or prove this account's eligibility. Confirm the feature is available without an upgrade in the account UI.
-- ChatGPT custom MCP with full tool support requires a Business or Enterprise/Edu workspace. On Pro, custom servers are limited to read/fetch permissions. Workspace plan, policy, and the user's create permission are unknown. Confirm them before Gate C.
+- ChatGPT custom MCP tool support depends on workspace plan and policy. The configured connector has already called read-only bridge tools; confirm policy/role before adding another workspace or connector.
 - A Cloudflare-managed domain/zone is required for the published hostname. Use only a dedicated subdomain such as `mcp.<YOUR_DOMAIN>`; leave root DNS records and nameservers alone.
-- The protocol pieces look compatible on paper. Actual tenant metadata, callback URI acceptance, and ChatGPT OAuth behavior remain unverified until a later authorized ChatGPT connection test.
+- OAuth login and read-only tool invocation were previously exercised in ChatGPT. The write tool is not confirmed until ChatGPT refreshes its tool list and completes a write task with local approval.
 
 ## Authentication behavior
 

@@ -10,9 +10,9 @@ import (
 	"testing"
 	"time"
 
-	"example.com/codex-chatgpt-bridge/internal/audit"
-	"example.com/codex-chatgpt-bridge/internal/domain"
-	"example.com/codex-chatgpt-bridge/internal/repository/sqlite"
+	"github.com/zazhedho/codex-chatgpt-bridge/internal/audit"
+	"github.com/zazhedho/codex-chatgpt-bridge/internal/domain"
+	"github.com/zazhedho/codex-chatgpt-bridge/internal/repository/sqlite"
 )
 
 type taskQueueStub struct {
@@ -52,7 +52,8 @@ func TestTaskServiceAuthorizesWorkspaceAndThreadOwnership(t *testing.T) {
 		t.Fatal(err)
 	}
 	queue := &taskQueueStub{}
-	tasks := NewTaskService(store, store, workspaces, queue, allowTaskExecution{}, auditLogger, 20_000)
+	approvals := NewApprovalService(store, workspaces)
+	tasks := NewTaskService(store, store, workspaces, approvals, queue, allowTaskExecution{}, auditLogger, 20_000, 20)
 	if _, err := tasks.Start(context.Background(), workspaceA.ID, "Analyze project", ""); !errors.Is(err, domain.ErrNotAuthorized) {
 		t.Fatalf("unauthorized task error = %v", err)
 	}
@@ -74,6 +75,81 @@ func TestTaskServiceAuthorizesWorkspaceAndThreadOwnership(t *testing.T) {
 	}
 }
 
+func TestWriteTaskWaitsForLocalApprovalAndWorkspaceOptIn(t *testing.T) {
+	store, err := sqlite.Open(filepath.Join(t.TempDir(), "db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	home := t.TempDir()
+	logger := audit.New(store)
+	workspaces := NewWorkspaceService(store, logger, home, "")
+	workspace := registerForTest(t, workspaces, home, "project-a")
+	queue := &taskQueueStub{}
+	approvals := NewApprovalService(store, workspaces)
+	tasks := NewTaskService(store, store, workspaces, approvals, queue, allowTaskExecution{}, logger, 20_000, 20)
+	ctx := authorizedContext("fedcba9876543210fedcba9876543210")
+
+	if _, _, err := tasks.StartWrite(ctx, workspace.ID, "change a fixture", ""); !errors.Is(err, domain.ErrNotAuthorized) {
+		t.Fatalf("read-only workspace accepted a write task: %v", err)
+	}
+	if err := workspaces.SetWriteEnabledLocal(context.Background(), workspace.ID, true, "operator"); err != nil {
+		t.Fatal(err)
+	}
+	task, approval, err := tasks.StartWrite(ctx, workspace.ID, "change a fixture", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.Status != domain.TaskWaitingApproval || task.ExecutionMode != domain.ExecutionWorkspaceWrite {
+		t.Fatalf("write task was not held for approval: %+v", task)
+	}
+	if approval.Status != domain.ApprovalPending || approval.WorkspaceID != workspace.ID || approval.OperationType != "codex.workspace-write" {
+		t.Fatalf("write approval does not bind operation and workspace: %+v", approval)
+	}
+	if !strings.Contains(approval.ParametersJSON, "change a fixture") || !strings.Contains(approval.ParametersJSON, task.ID) {
+		t.Fatal("local approval does not contain the exact task parameters")
+	}
+	if len(queue.jobs) != 0 {
+		t.Fatal("write task was queued before local approval")
+	}
+}
+
+func TestDisablingWorkspaceWriteCancelsPendingTaskAndApproval(t *testing.T) {
+	store, err := sqlite.Open(filepath.Join(t.TempDir(), "db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	home := t.TempDir()
+	logger := audit.New(store)
+	workspaces := NewWorkspaceService(store, logger, home, "")
+	workspace := registerForTest(t, workspaces, home, "project-a")
+	if err := workspaces.SetWriteEnabledLocal(context.Background(), workspace.ID, true, "operator"); err != nil {
+		t.Fatal(err)
+	}
+	approvals := NewApprovalService(store, workspaces)
+	tasks := NewTaskService(store, store, workspaces, approvals, &taskQueueStub{}, allowTaskExecution{}, logger, 20_000, 20)
+	ctx := authorizedContext("fedcba9876543210fedcba9876543210")
+	task, approval, err := tasks.StartWrite(ctx, workspace.ID, "change fixture", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := workspaces.SetWriteEnabledLocal(context.Background(), workspace.ID, false, "operator"); err != nil {
+		t.Fatal(err)
+	}
+	storedTask, err := store.GetTask(context.Background(), task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	storedApproval, err := approvals.GetLocal(context.Background(), approval.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if storedTask.Status != domain.TaskCancelled || storedApproval.Status != domain.ApprovalRejected || storedApproval.ParametersJSON != "{}" {
+		t.Fatalf("write disable left pending work: task=%s approval=%s parameters=%s", storedTask.Status, storedApproval.Status, storedApproval.ParametersJSON)
+	}
+}
+
 func TestTaskResultIsRedactedAndOutputExpiryIsVisible(t *testing.T) {
 	store, err := sqlite.Open(filepath.Join(t.TempDir(), "db"))
 	if err != nil {
@@ -84,7 +160,7 @@ func TestTaskResultIsRedactedAndOutputExpiryIsVisible(t *testing.T) {
 	workspaces := NewWorkspaceService(store, audit.New(store), home, "")
 	workspace := registerForTest(t, workspaces, home, "project-a")
 	queue := &taskQueueStub{}
-	tasks := NewTaskService(store, store, workspaces, queue, allowTaskExecution{}, audit.New(store), 20_000)
+	tasks := NewTaskService(store, store, workspaces, NewApprovalService(store, workspaces), queue, allowTaskExecution{}, audit.New(store), 20_000, 20)
 	ctx := authorizedContext("fedcba9876543210fedcba9876543210")
 	task, err := tasks.Start(ctx, workspace.ID, "Review", "")
 	if err != nil {
@@ -160,7 +236,7 @@ func TestTaskExecutionFailsClosedWithoutVerifiedReadIsolation(t *testing.T) {
 	workspaces := NewWorkspaceService(store, logger, home, "")
 	workspace := registerForTest(t, workspaces, home, "project-a")
 	queue := &taskQueueStub{}
-	tasks := NewTaskService(store, store, workspaces, queue, nil, logger, 20_000)
+	tasks := NewTaskService(store, store, workspaces, NewApprovalService(store, workspaces), queue, nil, logger, 20_000, 20)
 	ctx := authorizedContext("fedcba9876543210fedcba9876543210")
 	if _, err := tasks.Start(ctx, workspace.ID, "Read the project", ""); !errors.Is(err, domain.ErrServiceUnavailable) {
 		t.Fatalf("task start error=%v, want service unavailable", err)

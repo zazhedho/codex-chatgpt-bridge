@@ -2,14 +2,17 @@ package service
 
 import (
 	"context"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/hex"
 	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
-	"example.com/codex-chatgpt-bridge/internal/domain"
-	"example.com/codex-chatgpt-bridge/internal/repository/sqlite"
+	"github.com/zazhedho/codex-chatgpt-bridge/internal/domain"
+	"github.com/zazhedho/codex-chatgpt-bridge/internal/repository/sqlite"
 )
 
 func TestApprovalBindsParametersAndArtifactAndConsumesOnce(t *testing.T) {
@@ -43,6 +46,121 @@ func TestApprovalBindsParametersAndArtifactAndConsumesOnce(t *testing.T) {
 	}
 	if _, err := approvals.ConsumeOnce(context.Background(), created.ID, input.Parameters, input.Artifact, true); !errors.Is(err, domain.ErrConflict) {
 		t.Fatalf("duplicate consume error = %v", err)
+	}
+}
+
+func TestWriteApprovalExpiryAndPromptTamperingFailClosed(t *testing.T) {
+	for _, scenario := range []string{"expired", "modified-prompt"} {
+		t.Run(scenario, func(t *testing.T) {
+			dataDir := t.TempDir()
+			store, err := sqlite.Open(dataDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			home := t.TempDir()
+			workspaces := NewWorkspaceService(store, nil, home, "")
+			workspace := registerForTest(t, workspaces, home, "project-a")
+			if err := workspaces.SetWriteEnabledLocal(context.Background(), workspace.ID, true, "operator"); err != nil {
+				t.Fatal(err)
+			}
+			prompt := "change fixture from old to new"
+			digest := sha256.Sum256([]byte(prompt))
+			now := time.Now().UTC()
+			task := domain.Task{ID: "00000000-0000-4000-8000-000000000002", WorkspaceID: workspace.ID, ExecutionMode: domain.ExecutionWorkspaceWrite, Status: domain.TaskWaitingApproval, PromptHash: hex.EncodeToString(digest[:]), Progress: []domain.ProgressEvent{}, CreatedAt: now, UpdatedAt: now}
+			approvals := NewApprovalService(store, workspaces)
+			approval, err := approvals.CreateWriteTaskApproval(context.Background(), task, prompt, 4)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := approvals.ApproveLocal(context.Background(), approval.ID, ApprovalActor{Channel: "local", Subject: "operator"}); err != nil {
+				t.Fatal(err)
+			}
+			db, err := sql.Open("sqlite", filepath.Join(dataDir, "bridge.sqlite"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			switch scenario {
+			case "expired":
+				if _, err := db.Exec(`UPDATE approvals SET expires_at=? WHERE id=?`, now.Add(-time.Second).UnixMilli(), approval.ID); err != nil {
+					t.Fatal(err)
+				}
+			case "modified-prompt":
+				modified := strings.Replace(approval.ParametersJSON, prompt, "different prompt", 1)
+				if _, err := db.Exec(`UPDATE approvals SET parameters_json=? WHERE id=?`, modified, approval.ID); err != nil {
+					t.Fatal(err)
+				}
+			}
+			_, claimErr := store.ClaimApprovedWriteTask(context.Background(), now)
+			if scenario == "expired" && !errors.Is(claimErr, domain.ErrNotFound) {
+				t.Fatalf("expired approval claim error=%v", claimErr)
+			}
+			if scenario == "modified-prompt" && !errors.Is(claimErr, domain.ErrNotAuthorized) {
+				t.Fatalf("modified prompt claim error=%v", claimErr)
+			}
+			storedTask, err := store.GetTask(context.Background(), task.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			storedApproval, err := store.GetApproval(context.Background(), approval.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantApproval := domain.ApprovalExpired
+			if scenario == "modified-prompt" {
+				wantApproval = domain.ApprovalRejected
+			}
+			if storedTask.Status != domain.TaskFailed || storedApproval.Status != wantApproval || storedApproval.ParametersJSON != "{}" {
+				t.Fatalf("unsafe write request remained: task=%s approval=%s parameters=%s", storedTask.Status, storedApproval.Status, storedApproval.ParametersJSON)
+			}
+		})
+	}
+}
+
+func TestExpiredWriteApprovalCannotRetainPromptOrTask(t *testing.T) {
+	dataDir := t.TempDir()
+	store, err := sqlite.Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	home := t.TempDir()
+	workspaces := NewWorkspaceService(store, nil, home, "")
+	workspace := registerForTest(t, workspaces, home, "project-a")
+	if err := workspaces.SetWriteEnabledLocal(context.Background(), workspace.ID, true, "operator"); err != nil {
+		t.Fatal(err)
+	}
+	approvals := NewApprovalService(store, workspaces)
+	prompt := "change this disposable fixture"
+	promptHash := sha256.Sum256([]byte(prompt))
+	now := time.Now().UTC()
+	task := domain.Task{ID: "00000000-0000-4000-8000-000000000003", WorkspaceID: workspace.ID, ExecutionMode: domain.ExecutionWorkspaceWrite, Status: domain.TaskWaitingApproval, PromptHash: hex.EncodeToString(promptHash[:]), Progress: []domain.ProgressEvent{}, CreatedAt: now, UpdatedAt: now}
+	approval, err := approvals.CreateWriteTaskApproval(context.Background(), task, prompt, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", filepath.Join(dataDir, "bridge.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`UPDATE approvals SET expires_at=? WHERE id=?`, now.Add(-time.Second).UnixMilli(), approval.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := approvals.ApproveLocal(context.Background(), approval.ID, ApprovalActor{Channel: "local", Subject: "operator"}); !errors.Is(err, domain.ErrConflict) {
+		t.Fatalf("expired local approval error=%v", err)
+	}
+	storedApproval, err := store.GetApproval(context.Background(), approval.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	storedTask, err := store.GetTask(context.Background(), task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if storedApproval.Status != domain.ApprovalExpired || storedApproval.ParametersJSON != "{}" || storedTask.Status != domain.TaskFailed {
+		t.Fatalf("expired approval retained work: approval=%s parameters=%s task=%s", storedApproval.Status, storedApproval.ParametersJSON, storedTask.Status)
 	}
 }
 

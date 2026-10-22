@@ -12,18 +12,20 @@ import (
 	"path/filepath"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"example.com/codex-chatgpt-bridge/internal/audit"
-	"example.com/codex-chatgpt-bridge/internal/config"
-	"example.com/codex-chatgpt-bridge/internal/domain"
-	"example.com/codex-chatgpt-bridge/internal/repository/sqlite"
-	"example.com/codex-chatgpt-bridge/internal/security"
-	"example.com/codex-chatgpt-bridge/internal/service"
+	"github.com/google/jsonschema-go/jsonschema"
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/zazhedho/codex-chatgpt-bridge/internal/audit"
+	"github.com/zazhedho/codex-chatgpt-bridge/internal/config"
+	"github.com/zazhedho/codex-chatgpt-bridge/internal/domain"
+	"github.com/zazhedho/codex-chatgpt-bridge/internal/repository/sqlite"
+	"github.com/zazhedho/codex-chatgpt-bridge/internal/security"
+	"github.com/zazhedho/codex-chatgpt-bridge/internal/service"
 )
 
 type queueStub struct {
@@ -45,6 +47,36 @@ func (q *queueStub) Cancel(_ context.Context, id string) error {
 type codexStatusStub struct{}
 
 func (codexStatusStub) Connected() bool { return false }
+
+type sessionCatalogContractStub struct {
+	session domain.CodexSession
+	bridge  domain.CodexSession
+}
+
+func (s *sessionCatalogContractStub) ListCLISessions(_ context.Context, workspacePath string) ([]domain.CodexSession, error) {
+	if s.session.WorkspacePath == workspacePath && s.session.Source == "cli" {
+		return []domain.CodexSession{s.session}, nil
+	}
+	return nil, nil
+}
+func (s *sessionCatalogContractStub) ListCLISessionsPage(_ context.Context, workspacePath, search, cursor string, limit int) (domain.CodexSessionPage, error) {
+	displayName := s.session.Title
+	if strings.TrimSpace(displayName) == "" {
+		displayName = s.session.Preview
+	}
+	if (workspacePath == "" || s.session.WorkspacePath == workspacePath) && s.session.Source == "cli" && (search == "" || strings.Contains(strings.ToLower(displayName), strings.ToLower(search))) && cursor == "" {
+		return domain.CodexSessionPage{Sessions: []domain.CodexSession{s.session}}, nil
+	}
+	return domain.CodexSessionPage{}, nil
+}
+func (s *sessionCatalogContractStub) ReadSessionMetadata(_ context.Context, threadID string) (domain.CodexSession, error) {
+	for _, session := range []domain.CodexSession{s.session, s.bridge} {
+		if session.ID == threadID {
+			return session, nil
+		}
+	}
+	return domain.CodexSession{}, domain.ErrNotFound
+}
 
 type allowTaskExecution struct{}
 
@@ -173,7 +205,12 @@ func TestModernServerDiscoveryAndToolsList(t *testing.T) {
 		ID      any    `json:"id"`
 		Result  struct {
 			Tools []struct {
-				Name string `json:"name"`
+				Name         string          `json:"name"`
+				Description  string          `json:"description"`
+				InputSchema  json.RawMessage `json:"inputSchema"`
+				OutputSchema json.RawMessage `json:"outputSchema"`
+				Annotations  json.RawMessage `json:"annotations"`
+				Meta         json.RawMessage `json:"_meta"`
 			} `json:"tools"`
 			Meta map[string]json.RawMessage `json:"_meta"`
 		} `json:"result"`
@@ -181,8 +218,67 @@ func TestModernServerDiscoveryAndToolsList(t *testing.T) {
 	if err := json.Unmarshal(tools.Body.Bytes(), &listed); err != nil {
 		t.Fatalf("decode tools/list response: %v; body=%s", err, tools.Body.String())
 	}
-	if listed.JSONRPC != "2.0" || listed.ID != "tools-1" || len(listed.Result.Tools) != 15 {
+	if listed.JSONRPC != "2.0" || listed.ID != "tools-1" || len(listed.Result.Tools) != 20 {
 		t.Fatalf("tools/list envelope or count invalid: jsonrpc=%q id=%v tools=%d", listed.JSONRPC, listed.ID, len(listed.Result.Tools))
+	}
+	toolNames := make(map[string]bool, len(listed.Result.Tools))
+	for _, tool := range listed.Result.Tools {
+		if tool.Name == "" || toolNames[tool.Name] {
+			t.Fatalf("empty or duplicate tool name %q", tool.Name)
+		}
+		toolNames[tool.Name] = true
+		if tool.Description == "" {
+			t.Errorf("tool %q has no description", tool.Name)
+		}
+		if len(tool.Annotations) > 0 && !json.Valid(tool.Annotations) {
+			t.Errorf("tool %q has malformed annotations", tool.Name)
+		}
+		if len(tool.Meta) > 0 && !json.Valid(tool.Meta) {
+			t.Errorf("tool %q has malformed _meta", tool.Name)
+		}
+		assertToolJSONSchema(t, tool.Name+" inputSchema", tool.InputSchema, true)
+		if len(tool.OutputSchema) > 0 {
+			assertToolJSONSchema(t, tool.Name+" outputSchema", tool.OutputSchema, false)
+		}
+		if tool.Name == "codex_list_local_sessions" {
+			var inputSchema map[string]json.RawMessage
+			if err := json.Unmarshal(tool.InputSchema, &inputSchema); err != nil {
+				t.Fatalf("decode local session input schema: %v", err)
+			}
+			if _, exists := inputSchema["required"]; exists {
+				t.Errorf("catalog parameters are all optional; omit required from inputSchema")
+			}
+		}
+		if tool.Name == "codex_list_local_sessions" && len(tool.OutputSchema) > 0 {
+			var schema jsonschema.Schema
+			if err := json.Unmarshal(tool.OutputSchema, &schema); err != nil {
+				t.Fatalf("decode local session output schema: %v", err)
+			}
+			resolved, err := schema.Resolve(nil)
+			if err != nil {
+				t.Fatalf("resolve local session output schema: %v", err)
+			}
+			output, err := json.Marshal(SessionCatalogOutput{Sessions: []SessionCatalogEntryDTO{{
+				ThreadID: "fixture-thread", DisplayName: "Fixture session", Project: "fixture-project", Status: "idle",
+				UpdatedAt: time.Now().UnixMilli(), ConnectionStatus: "trusted", CanResume: true,
+			}}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var value any
+			if err := json.Unmarshal(output, &value); err != nil {
+				t.Fatal(err)
+			}
+			if err := resolved.Validate(value); err != nil {
+				t.Errorf("local session output schema rejects actual empty-page response: %v", err)
+			}
+		}
+		if tool.Name == "codex_list_session_projects" && len(tool.OutputSchema) > 0 {
+			assertOutputSchemaAccepts(t, tool.OutputSchema, SessionProjectsOutput{Projects: []SessionProjectChoiceDTO{{ProjectID: "0123456789abcdef0123456789abcdef", Name: "fixture", RelativePath: "fixture"}}})
+		}
+		if tool.Name == "codex_request_session_project_binding" && len(tool.OutputSchema) > 0 {
+			assertOutputSchemaAccepts(t, tool.OutputSchema, SessionProjectBindingOutput{RequestID: "fixture-request", ThreadID: "fixture-thread", ProjectID: "0123456789abcdef0123456789abcdef", Status: domain.SessionProjectBindingPending, ExpiresAt: time.Now().UnixMilli()})
+		}
 	}
 	assertServerInfo(t, listed.Result.Meta)
 	t.Logf("tools/list: HTTP %d %s id=%v tools=%d serverInfo=%s", tools.Code, tools.Header().Get("Content-Type"), listed.ID, len(listed.Result.Tools), listed.Result.Meta["io.modelcontextprotocol/serverInfo"])
@@ -197,6 +293,134 @@ func TestModernServerDiscoveryAndToolsList(t *testing.T) {
 	if wrongOrigin := request("server/discover", "wrong-origin", "2026-07-28", "", "https://attacker.example"); wrongOrigin.Code != http.StatusForbidden {
 		t.Fatalf("modern discovery accepted invalid Origin: status=%d", wrongOrigin.Code)
 	}
+}
+
+func assertOutputSchemaAccepts(t *testing.T, raw json.RawMessage, output any) {
+	t.Helper()
+	var schema jsonschema.Schema
+	if err := json.Unmarshal(raw, &schema); err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := schema.Resolve(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var value any
+	if err := json.Unmarshal(encoded, &value); err != nil {
+		t.Fatal(err)
+	}
+	if err := resolved.Validate(value); err != nil {
+		t.Errorf("serialized tool output violates schema: %v", err)
+	}
+}
+
+func assertToolJSONSchema(t *testing.T, name string, raw json.RawMessage, requireObject bool) {
+	t.Helper()
+	var schema jsonschema.Schema
+	if err := json.Unmarshal(raw, &schema); err != nil {
+		t.Fatalf("%s is invalid JSON Schema: %v", name, err)
+	}
+	if _, err := schema.Resolve(nil); err != nil {
+		t.Fatalf("%s cannot be resolved: %v", name, err)
+	}
+	var root any
+	if err := json.Unmarshal(raw, &root); err != nil {
+		t.Fatalf("decode %s: %v", name, err)
+	}
+	if requireObject {
+		object, ok := root.(map[string]any)
+		if !ok || object["type"] != "object" {
+			t.Fatalf("%s root must be a JSON Schema object", name)
+		}
+	}
+
+	var visit func(any, string)
+	visit = func(value any, path string) {
+		t.Helper()
+		if _, ok := value.(bool); ok {
+			return
+		}
+		object, ok := value.(map[string]any)
+		if !ok {
+			t.Errorf("%s %s must be a schema object or boolean", name, path)
+			return
+		}
+		if rawType, exists := object["type"]; exists {
+			validType := func(value any) bool {
+				switch value {
+				case "object", "array", "string", "integer", "number", "boolean", "null":
+					return true
+				default:
+					return false
+				}
+			}
+			switch types := rawType.(type) {
+			case string:
+				if !validType(types) {
+					t.Errorf("%s %s has invalid type %q", name, path, types)
+				}
+			case []any:
+				for _, item := range types {
+					if !validType(item) {
+						t.Errorf("%s %s has invalid union type %v", name, path, item)
+					}
+				}
+			default:
+				t.Errorf("%s %s type must be a string or string array", name, path)
+			}
+		}
+		properties, hasProperties := object["properties"].(map[string]any)
+		if rawRequired, exists := object["required"]; exists {
+			required, ok := rawRequired.([]any)
+			if !ok {
+				serialized, _ := json.Marshal(object)
+				t.Errorf("%s %s required must be an array; schema=%s", name, path, serialized)
+			} else {
+				for _, item := range required {
+					property, ok := item.(string)
+					if !ok || !hasProperties || properties[property] == nil {
+						t.Errorf("%s %s required entry %v has no matching property", name, path, item)
+					}
+				}
+			}
+		}
+		if object["type"] == "array" {
+			if _, ok := object["items"]; !ok {
+				t.Errorf("%s %s array has no items schema", name, path)
+			}
+		}
+		for _, key := range []string{"properties", "patternProperties", "$defs", "definitions", "dependentSchemas"} {
+			if values, ok := object[key].(map[string]any); ok {
+				for child, childSchema := range values {
+					visit(childSchema, path+"."+key+"."+child)
+				}
+			} else if _, exists := object[key]; exists {
+				t.Errorf("%s %s %s must be an object", name, path, key)
+			}
+		}
+		for _, key := range []string{"items", "contains", "not", "if", "then", "else", "propertyNames", "unevaluatedProperties", "unevaluatedItems", "contentSchema", "additionalProperties"} {
+			if child, exists := object[key]; exists {
+				visit(child, path+"."+key)
+			}
+		}
+		for _, key := range []string{"allOf", "anyOf", "oneOf", "prefixItems"} {
+			if children, exists := object[key]; exists {
+				array, ok := children.([]any)
+				if !ok {
+					t.Errorf("%s %s %s must be an array", name, path, key)
+					continue
+				}
+				for i, child := range array {
+					visit(child, path+"."+key+"["+strconv.Itoa(i)+"]")
+				}
+			}
+		}
+	}
+	visit(root, "#")
 }
 
 func TestLegacyMCPInitializeAndToolsListRemainSupported(t *testing.T) {
@@ -241,7 +465,7 @@ func TestLegacyMCPInitializeAndToolsListRemainSupported(t *testing.T) {
 			Tools []json.RawMessage `json:"tools"`
 		} `json:"result"`
 	}
-	if err := json.Unmarshal(listed.Body.Bytes(), &response); err != nil || len(response.Result.Tools) != 15 {
+	if err := json.Unmarshal(listed.Body.Bytes(), &response); err != nil || len(response.Result.Tools) != 20 {
 		t.Fatalf("legacy tools/list invalid: tools=%d err=%v body=%s", len(response.Result.Tools), err, listed.Body.String())
 	}
 	closeRequest := httptest.NewRequest(http.MethodDelete, "http://127.0.0.1:8787/mcp", nil)
@@ -266,8 +490,10 @@ func TestAllMCPContractsThroughAuthenticatedHTTP(t *testing.T) {
 	logger := audit.New(store)
 	home := t.TempDir()
 	workspaces := service.NewWorkspaceService(store, logger, home, "")
+	catalog := &sessionCatalogContractStub{}
+	sessions := service.NewSessionService(store, workspaces, catalog, logger)
 	queue := &queueStub{store: store}
-	tasks := service.NewTaskService(store, store, workspaces, queue, allowTaskExecution{}, logger, 20_000)
+	tasks := service.NewTaskService(store, store, workspaces, service.NewApprovalService(store, workspaces), queue, allowTaskExecution{}, logger, 20_000, 20)
 	approvals := service.NewApprovalService(store, workspaces)
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -275,7 +501,7 @@ func TestAllMCPContractsThroughAuthenticatedHTTP(t *testing.T) {
 	}
 	port := listener.Addr().(*net.TCPAddr).Port
 	cfg := config.Config{Host: "127.0.0.1", Port: port, AuthMode: config.AuthModeCloudflareAccess, MaxRequestBytes: 64 << 10}
-	handler := NewHTTPHandler(Dependencies{Config: cfg, CloudflareVerifier: accessVerifierStub{}, Workspaces: workspaces, Tasks: tasks, Approvals: approvals, Audit: logger, Codex: codexStatusStub{}, StartedAt: time.Now()})
+	handler := NewHTTPHandler(Dependencies{Config: cfg, CloudflareVerifier: accessVerifierStub{}, Workspaces: workspaces, Tasks: tasks, Sessions: sessions, Approvals: approvals, Audit: logger, Codex: codexStatusStub{}, StartedAt: time.Now()})
 	httpServer := &http.Server{Handler: handler}
 	go func() { _ = httpServer.Serve(listener) }()
 	t.Cleanup(func() { _ = httpServer.Close() })
@@ -301,7 +527,7 @@ func TestAllMCPContractsThroughAuthenticatedHTTP(t *testing.T) {
 		byName[tool.Name] = tool
 	}
 	sort.Strings(gotNames)
-	wantNames := []string{"approval_get_details", "approval_list_pending", "bridge_get_capabilities", "bridge_get_status", "codex_cancel_task", "codex_get_changes", "codex_get_progress", "codex_get_result", "codex_get_task", "codex_list_threads", "codex_resume_thread", "codex_start_task", "workspace_get", "workspace_list", "workspace_register"}
+	wantNames := []string{"approval_get_details", "approval_list_pending", "bridge_get_capabilities", "bridge_get_status", "codex_cancel_task", "codex_get_changes", "codex_get_progress", "codex_get_result", "codex_get_task", "codex_list_local_sessions", "codex_list_session_projects", "codex_list_threads", "codex_request_session_attach", "codex_request_session_project_binding", "codex_resume_thread", "codex_start_task", "codex_start_write_task", "workspace_get", "workspace_list", "workspace_register"}
 	if fmt.Sprint(gotNames) != fmt.Sprint(wantNames) {
 		t.Fatalf("tools = %v, want %v", gotNames, wantNames)
 	}
@@ -312,10 +538,13 @@ func TestAllMCPContractsThroughAuthenticatedHTTP(t *testing.T) {
 		t.Fatal("codex_cancel_task annotation is unsafe")
 	}
 	readOnlyTools := map[string]bool{
-		"workspace_list": true, "workspace_get": true, "codex_list_threads": true,
+		"workspace_list": true, "workspace_get": true, "codex_list_threads": true, "codex_list_local_sessions": true, "codex_list_session_projects": true,
 		"codex_get_task": true, "codex_get_progress": true, "codex_get_result": true,
 		"codex_get_changes": true, "approval_list_pending": true, "approval_get_details": true,
 		"bridge_get_status": true, "bridge_get_capabilities": true,
+	}
+	if byName["codex_start_write_task"].InputSchema == nil || byName["codex_start_write_task"].Annotations == nil || byName["codex_start_write_task"].Annotations.ReadOnlyHint {
+		t.Fatal("codex_start_write_task is missing a mutating tool contract")
 	}
 	for name, tool := range byName {
 		_, readOnly := readOnlyTools[name]
@@ -324,7 +553,7 @@ func TestAllMCPContractsThroughAuthenticatedHTTP(t *testing.T) {
 			continue
 		}
 		if !readOnly {
-			wantDestructive := name == "codex_cancel_task"
+			wantDestructive := name == "codex_cancel_task" || name == "codex_start_write_task"
 			if tool.Annotations.DestructiveHint == nil || *tool.Annotations.DestructiveHint != wantDestructive {
 				t.Errorf("%s has incorrect destructive annotation", name)
 			}
@@ -359,6 +588,9 @@ func TestAllMCPContractsThroughAuthenticatedHTTP(t *testing.T) {
 	if result := call("codex_get_task", map[string]any{"taskId": "bad"}); !result.IsError {
 		t.Fatal("invalid task ID accepted")
 	}
+	if result := call("codex_list_local_sessions", map[string]any{}); !result.IsError {
+		t.Fatal("global session catalog was available before local owner approval")
+	}
 
 	workspacePath := filepath.Join(home, "project-a")
 	if err := os.Mkdir(workspacePath, 0o700); err != nil {
@@ -371,6 +603,64 @@ func TestAllMCPContractsThroughAuthenticatedHTTP(t *testing.T) {
 	requestID := structured(registered)["requestId"].(string)
 	if _, err := workspaces.ApproveRegistration(context.Background(), requestID, "test-local-user"); err != nil {
 		t.Fatal(err)
+	}
+	if err := sessions.SetCatalogAccessLocal(context.Background(), true, "test-local-user"); err != nil {
+		t.Fatal(err)
+	}
+	if err := sessions.SetWorkspaceTrustLocal(context.Background(), "project-a", true, "test-local-user"); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Truncate(time.Second)
+	approvedWorkspace, err := workspaces.GetLocal(ctx, "project-a")
+	if err != nil {
+		t.Fatalf("fixture workspace unavailable: err=%v", err)
+	}
+	catalog.session = domain.CodexSession{ID: "cli-session-fixture", WorkspacePath: approvedWorkspace.RootPath, Source: "cli", Title: "fixture session", Status: "notLoaded", CreatedAt: now.Add(-time.Hour), UpdatedAt: now}
+	catalogSessions, err := catalog.ListCLISessions(ctx, approvedWorkspace.RootPath)
+	if err != nil || len(catalogSessions) != 1 || catalogSessions[0].ID != catalog.session.ID {
+		t.Fatalf("fixture session not present in local CLI catalog: sessions=%+v err=%v", catalogSessions, err)
+	}
+	attach := call("codex_request_session_attach", map[string]any{"workspaceId": "project-a", "threadId": catalog.session.ID})
+	if attach.IsError || structured(attach)["status"] != domain.SessionAttachPending {
+		t.Fatalf("codex_request_session_attach did not return a pending request: error=%t content=%s structured=%v", attach.IsError, contentText(attach), attach.StructuredContent)
+	}
+	if result := call("codex_list_threads", map[string]any{"workspaceId": "project-a"}); result.IsError || strings.Contains(contentText(result), catalog.session.ID) {
+		t.Fatalf("unapproved session leaked through MCP thread list: %v", result.Content)
+	}
+	requestID = structured(attach)["requestId"].(string)
+	if _, err := sessions.ApproveLocal(context.Background(), requestID, "test-local-user"); err != nil {
+		t.Fatal(err)
+	}
+	listedAttached := call("codex_list_threads", map[string]any{"workspaceId": "project-a"})
+	if listedAttached.IsError || !strings.Contains(contentText(listedAttached), catalog.session.ID) {
+		t.Fatalf("approved CLI session not exposed through MCP thread list: %v", listedAttached.Content)
+	}
+	globalSessions := call("codex_list_local_sessions", map[string]any{"workspaceId": "project-a", "limit": 10})
+	if globalSessions.IsError || !strings.Contains(contentText(globalSessions), catalog.session.ID) || !strings.Contains(contentText(globalSessions), "trusted") {
+		t.Fatalf("trusted global session catalog was not exposed: %v", globalSessions.Content)
+	}
+	globalRows, _ := structured(globalSessions)["sessions"].([]any)
+	if len(globalRows) != 1 {
+		t.Fatalf("catalog returned %d rows, want one", len(globalRows))
+	}
+	firstGlobalRow, ok := globalRows[0].(map[string]any)
+	if !ok || firstGlobalRow["displayName"] != "fixture session" {
+		t.Fatalf("Codex thread name was not exposed as displayName: %v", globalSessions.StructuredContent)
+	}
+	catalog.session.Title = ""
+	catalog.session.Preview = "fixture\tpreview api_key=fixture-secret"
+	previewSessions := call("codex_list_local_sessions", map[string]any{"workspaceId": "project-a", "search": "preview", "limit": 10})
+	previewRows, _ := structured(previewSessions)["sessions"].([]any)
+	if len(previewRows) != 1 {
+		t.Fatalf("preview search returned %d rows, want one", len(previewRows))
+	}
+	previewRow, ok := previewRows[0].(map[string]any)
+	if previewSessions.IsError || !ok || previewRow["displayName"] != "fixture preview api_key=[REDACTED]" || strings.Contains(contentText(previewSessions), "fixture-secret") {
+		t.Fatalf("sanitized preview fallback was not searchable: %v", previewSessions.StructuredContent)
+	}
+	resumeAttached := call("codex_resume_thread", map[string]any{"workspaceId": "project-a", "threadId": catalog.session.ID, "prompt": "Continue read-only analysis."})
+	if resumeAttached.IsError {
+		t.Fatalf("attached CLI session could not be resumed through MCP: %v", resumeAttached.Content)
 	}
 	if result := call("workspace_get", map[string]any{"workspaceId": "project-a"}); result.IsError {
 		t.Fatalf("workspace_get: %v", result.Content)
@@ -428,6 +718,7 @@ func TestAllMCPContractsThroughAuthenticatedHTTP(t *testing.T) {
 		}
 	}
 	threadID := "bridge-owned-thread"
+	catalog.bridge = domain.CodexSession{ID: threadID, WorkspacePath: approvedWorkspace.RootPath, Source: "appServer", Status: "notLoaded", CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()}
 	if err := store.SaveThread(ctx, domain.Thread{ID: threadID, WorkspaceID: "project-a", CreatedAt: time.Now().UTC()}); err != nil {
 		t.Fatal(err)
 	}
@@ -439,7 +730,7 @@ func TestAllMCPContractsThroughAuthenticatedHTTP(t *testing.T) {
 	}
 	resumed := call("codex_resume_thread", map[string]any{"workspaceId": "project-a", "threadId": threadID, "prompt": "Continue the analysis."})
 	if resumed.IsError {
-		t.Fatalf("codex_resume_thread: %v", resumed.Content)
+		t.Fatalf("codex_resume_thread: %s", contentText(resumed))
 	}
 	if result := call("codex_cancel_task", map[string]any{"taskId": taskID}); result.IsError {
 		t.Fatalf("codex_cancel_task: %v", result.Content)
@@ -521,6 +812,37 @@ func TestAllMCPContractsThroughAuthenticatedHTTP(t *testing.T) {
 	}
 	if result := call("codex_get_result", map[string]any{"taskId": largeTaskID}); !result.IsError {
 		t.Fatal("MCP returned a result larger than the bridge output limit")
+	}
+	if result := call("codex_start_write_task", map[string]any{"workspaceId": "project-a", "prompt": "change the fixture"}); !result.IsError {
+		t.Fatal("write task was accepted while the workspace remained read-only")
+	}
+	if err := workspaces.SetWriteEnabledLocal(context.Background(), "project-a", true, "test-local-user"); err != nil {
+		t.Fatal(err)
+	}
+	queue.mu.Lock()
+	queuedBeforeWrite := len(queue.jobs)
+	queue.mu.Unlock()
+	writeStarted := call("codex_start_write_task", map[string]any{"workspaceId": "project-a", "prompt": "change the fixture"})
+	if writeStarted.IsError {
+		t.Fatalf("codex_start_write_task: %s", contentText(writeStarted))
+	}
+	writeOutput := structured(writeStarted)
+	writeTaskID, _ := writeOutput["taskId"].(string)
+	approvalID, _ := writeOutput["approvalId"].(string)
+	if writeOutput["status"] != string(domain.TaskWaitingApproval) || writeOutput["executionMode"] != string(domain.ExecutionWorkspaceWrite) || !validTaskID(writeTaskID) || !validTaskID(approvalID) {
+		t.Fatalf("write request did not return a bound pending approval: %#v", writeOutput)
+	}
+	if taskResult := call("codex_get_task", map[string]any{"taskId": writeTaskID}); taskResult.IsError || structured(taskResult)["task"].(map[string]any)["status"] != string(domain.TaskWaitingApproval) {
+		t.Fatalf("write task did not persist pending state: %s", contentText(taskResult))
+	}
+	queue.mu.Lock()
+	queueSize := len(queue.jobs)
+	queue.mu.Unlock()
+	if queueSize != queuedBeforeWrite {
+		t.Fatalf("write request was queued before approval; queued jobs=%d", queueSize)
+	}
+	if details := call("approval_get_details", map[string]any{"approvalId": approvalID}); details.IsError || !strings.Contains(contentText(details), "change the fixture") {
+		t.Fatalf("local approval details do not show the exact task: %s", contentText(details))
 	}
 	auditRows, err := store.AuditEventCount(ctx)
 	if err != nil || auditRows == 0 {

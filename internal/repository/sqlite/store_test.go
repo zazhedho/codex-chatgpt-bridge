@@ -21,8 +21,8 @@ func TestOpenMigratesAndProtectsDatabaseFiles(t *testing.T) {
 	if err := store.db.QueryRow("SELECT COUNT(*) FROM schema_migrations").Scan(&migrations); err != nil {
 		t.Fatal(err)
 	}
-	if migrations != 2 {
-		t.Fatalf("migration count = %d, want 2", migrations)
+	if migrations != 7 {
+		t.Fatalf("migration count = %d, want 7", migrations)
 	}
 	for _, file := range []string{store.path, store.path + "-wal", store.path + "-shm"} {
 		info, err := os.Stat(file)
@@ -35,6 +35,34 @@ func TestOpenMigratesAndProtectsDatabaseFiles(t *testing.T) {
 		if info.Mode().Perm()&0o077 != 0 {
 			t.Errorf("database file %s has mode %o", filepath.Base(file), info.Mode().Perm())
 		}
+	}
+}
+
+func TestNewColumnsKeepExistingWorkspacesAndTasksReadOnly(t *testing.T) {
+	store, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err := store.db.Exec(`INSERT INTO workspaces(id, root_path, root_device, root_inode, created_at) VALUES ('fixture', '/tmp/fixture', 1, 2, 1)`); err != nil {
+		t.Fatal(err)
+	}
+	workspace, err := store.GetWorkspace(t.Context(), "fixture")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if workspace.WriteEnabled {
+		t.Fatal("existing workspace became writable by default")
+	}
+	if _, err := store.db.Exec(`INSERT INTO tasks(id, workspace_id, status, prompt_hash, created_at, updated_at) VALUES ('task', 'fixture', 'queued', 'hash', 1, 1)`); err != nil {
+		t.Fatal(err)
+	}
+	task, err := store.GetTask(t.Context(), "task")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.ExecutionMode != "read-only" {
+		t.Fatalf("existing task execution mode = %q, want read-only", task.ExecutionMode)
 	}
 }
 

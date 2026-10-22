@@ -45,6 +45,29 @@ go run ./cmd/bridge-admin workspace list
 
 Inspect the canonical path before approval. The request expires after 30 minutes. Registration grants read-only task access to that root subject to Codex's permission profile. Do not register `$HOME`, credential directories, or production secrets.
 
+## Enable and approve workspace writes
+
+Write access remains disabled until a local admin opts in. Enable only a workspace reviewed for source contents and secrets:
+
+```sh
+go run ./cmd/bridge-admin workspace enable-write <workspace-id>
+```
+
+In ChatGPT, request an implementation with `codex_start_write_task`. The tool returns `waiting_approval`, `taskId`, and `approvalId`; no Codex turn starts yet. Review and approve that exact request locally:
+
+```sh
+go run ./cmd/bridge-admin approval show <approval-id>
+go run ./cmd/bridge-admin approval approve <approval-id>
+```
+
+Then ChatGPT polls `codex_get_task` / `codex_get_progress` and reviews `codex_get_result` / `codex_get_changes`. A revision is a new task with a new local approval. Disable write after the work:
+
+```sh
+go run ./cmd/bridge-admin workspace disable-write <workspace-id>
+```
+
+Write approval expires after five minutes and is single-use. The bridge keeps the prompt in the local expiring approval row until consume/reject/expiry/cancel. Read-only workspaces are not upgraded automatically.
+
 ## Test and stop
 
 ```sh
@@ -52,9 +75,11 @@ make test
 make test-race
 make vet
 make test-e2e
+make test-write-e2e
+make test-session-catalog-e2e
 ```
 
-`make test-e2e` invokes the signed-in local Codex App Server and uses a temporary fixture. It is optional on other machines. `/healthz` and `/mcp` require bearer authentication and remain loopback-only.
+`make test-e2e` exercises the read-only fixture. `make test-write-e2e` invokes the signed-in local Codex App Server, creates a disposable writable fixture, and tests one local approval plus sandbox boundaries. `make test-session-catalog-e2e` creates two temporary `codex exec` sessions in separate fixture repositories, then tests metadata-only discovery and explicit resume switching. It uses a temporary Codex home linked to the existing ChatGPT authentication file and deletes the temporary thread data when the test ends. These opt-in tests may use the locally signed-in Codex account. `/healthz` and `/mcp` require the configured authentication mode and remain loopback-only.
 
 The bridge requires the Mac to be awake and online. Sleep pauses local execution and breaks tunnel connectivity; an offline Mac cannot receive calls. Restart marks active work interrupted and does not rerun it. SQLite, workspace registrations, and Codex thread metadata remain on disk.
 

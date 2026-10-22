@@ -3,7 +3,7 @@ package main
 import (
 	"log"
 
-	"example.com/codex-chatgpt-bridge/internal/app"
+	"github.com/zazhedho/codex-chatgpt-bridge/internal/app"
 )
 
 func main() {

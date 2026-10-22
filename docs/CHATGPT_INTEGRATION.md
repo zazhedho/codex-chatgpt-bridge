@@ -1,5 +1,44 @@
 # ChatGPT Integration Readiness
 
+## Workspace-write update — 2026-10-20
+
+The Cloudflare Access/Tunnel and ChatGPT route are already configured outside this historical Gate B attempt. ChatGPT has previously called read-only bridge tools. The Go bridge now exposes `codex_start_write_task`; refresh the tool list after the bridge restart. The tool only creates a pending request. A local user must inspect and approve it with `bridge-admin` before Codex writes. See the [approval model](APPROVAL_MODEL.md).
+
+Terminal Codex sessions can be attached through the separate `codex_request_session_attach` tool after discovery with local `bridge-admin codex-session list <workspace-id>` and one-time local approval. Refresh the ChatGPT tool list after a controlled bridge restart. Raw session history is not returned to MCP; resume runs in the same approved workspace with the current Bridge sandbox.
+
+## Global session switching
+
+The new `codex_list_local_sessions` tool is metadata-only and disabled until the local owner grants access. Set `BRIDGE_DATA_DIR` to the live Bridge database, then run:
+
+```sh
+go run ./cmd/bridge-admin codex-session catalog enable
+go run ./cmd/bridge-admin codex-session trust <approved-workspace-id>
+```
+
+After a controlled Bridge restart, use ChatGPT **Refresh tools**. Call `codex_list_local_sessions` with an optional `workspaceId`, metadata `search`, and page size; pass the returned `nextCursor` unchanged with the same filters. Pick a result marked `trusted` with `canResume=true`, then call `codex_resume_thread` with its explicit `workspaceId` and `threadId`. No session history is bulk-returned and no global active-thread pointer exists.
+
+For a workspace without trust, use the existing `codex_request_session_attach` and local `bridge-admin codex-session approve` flow. Workspace trust and global catalog access do not grant writes. A write task still requires its separate per-task approval. Revoke trust or catalog access locally with `codex-session untrust <workspace-id>` or `codex-session catalog disable`.
+
+## Controlled Bridge rollout
+
+The source and `bin/bridge` build include `codex_list_local_sessions`; the already-running Bridge still needs a controlled restart before ChatGPT can discover it. First use ChatGPT's existing `bridge_get_status` to confirm there are no active or queued tasks. Finish or cancel them and confirm terminal status before stopping the process. Pending write approvals should be reviewed locally and left untouched unless their task is intentionally being cancelled.
+
+From the repository, build the binaries, stop only the Go Bridge with Ctrl-C in its foreground terminal, then start the new binary with the existing local Cloudflare configuration loaded. Keep the separate `cloudflared` process running:
+
+```zsh
+make build
+set -a
+source .env.cloudflare.local
+set +a
+./bin/bridge
+```
+
+Do not enable shell tracing or print the environment. Confirm the new process owns only `127.0.0.1:8787`, then use ChatGPT **Refresh tools**. Verify `codex_list_local_sessions` appears before granting catalog access. The first owner action is to run `bridge-admin codex-session catalog enable` against the same `BRIDGE_DATA_DIR`; trust each approved workspace separately. No Cloudflare configuration or tunnel restart is needed.
+
+For a write task, request the exact workspace change in ChatGPT, inspect the returned approval ID locally with `go run ./cmd/bridge-admin approval show <approval-id>`, then approve once with `go run ./cmd/bridge-admin approval approve <approval-id>`. ChatGPT can then poll task/progress and review the result and diff. A revision needs a new task and approval.
+
+Run these local admin commands with `BRIDGE_DATA_DIR` set to the same directory as the running bridge. Otherwise, `bridge-admin` uses its default database and will not approve the live task. Set only that variable; do not source the Cloudflare credential file into the admin shell.
+
 This document records the earlier OpenAI Secure MCP Tunnel attempt and its static-bearer design. The current Cloudflare Access + Managed OAuth path is documented in [CLOUDFLARE_MCP_INTEGRATION.md](CLOUDFLARE_MCP_INTEGRATION.md); the two auth modes are exclusive.
 
 Status as of 2026-10-19: **blocked before Platform setup**. OpenAI Platform settings returned HTTP 403 in this session, and no Platform credentials were available locally. Therefore the intended organization/workspace, existing tunnels, roles, and billing context remain unknown; no tunnel or runtime key was created. No ChatGPT connector or launchd service was created.
@@ -99,7 +138,7 @@ OpenAI's current limits include a 120-second absolute MCP request deadline and 1
 ## Readiness evidence and limits
 
 - Host: macOS 27.0.1 arm64, Go 1.27.2, Codex CLI 0.163.0, tunnel-client 0.0.16. Bridge build passed.
-- Local isolated bridge: loopback `127.0.0.1:8787`; missing/invalid GET and POST auth returned 401; authenticated MCP initialize and `tools/list` returned 15 tools. One disposable workspace is approved locally.
+- Historical local isolated bridge test: loopback `127.0.0.1:8787`; missing/invalid GET and POST auth returned 401; authenticated MCP initialize and `tools/list` returned 15 tools at that time. Current source contract has 20 tools; refresh the deployed ChatGPT connection after a controlled Bridge restart before using the two project-binding tools.
 - The isolated profile was accepted by `tunnel-client profiles add`; it references a protected runtime-key file and complete `Bearer ...` header file for both runtime and discovery.
 - Platform settings were not inspectable: unauthenticated API request returned 401; Platform settings returned 403 in curl and the browser session. Existing tunnel inventory, organization/workspace, roles, runtime key, and price context remain **unknown**.
 - No `doctor`, tunnel `run`, health/readiness, outbound polling, connector, or ChatGPT Web call was performed. No tunnel resource was created.

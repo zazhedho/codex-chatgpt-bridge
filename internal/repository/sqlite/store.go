@@ -9,7 +9,7 @@ import (
 	"sort"
 	"strings"
 
-	"example.com/codex-chatgpt-bridge/migrations"
+	"github.com/zazhedho/codex-chatgpt-bridge/migrations"
 	_ "modernc.org/sqlite"
 )
 

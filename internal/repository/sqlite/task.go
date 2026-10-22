@@ -8,7 +8,7 @@ import (
 	"fmt"
 	"time"
 
-	"example.com/codex-chatgpt-bridge/internal/domain"
+	"github.com/zazhedho/codex-chatgpt-bridge/internal/domain"
 )
 
 func (s *Store) CreateTask(ctx context.Context, task domain.Task) error {
@@ -16,9 +16,13 @@ func (s *Store) CreateTask(ctx context.Context, task domain.Task) error {
 	if err != nil {
 		return err
 	}
-	_, err = s.db.ExecContext(ctx, `INSERT INTO tasks(id, workspace_id, thread_id, turn_id, status, prompt_hash, progress_json, result, diff, error, output_expired, created_at, updated_at)
-		VALUES (?, ?, NULLIF(?, ''), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		task.ID, task.WorkspaceID, task.ThreadID, task.TurnID, task.Status, task.PromptHash, string(progress), task.Result, task.Diff, task.Error, task.OutputExpired, task.CreatedAt.UnixMilli(), task.UpdatedAt.UnixMilli())
+	mode := task.ExecutionMode
+	if mode == "" {
+		mode = domain.ExecutionReadOnly
+	}
+	_, err = s.db.ExecContext(ctx, `INSERT INTO tasks(id, workspace_id, execution_mode, thread_id, turn_id, status, prompt_hash, progress_json, result, diff, error, output_expired, created_at, updated_at)
+		VALUES (?, ?, ?, NULLIF(?, ''), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		task.ID, task.WorkspaceID, mode, task.ThreadID, task.TurnID, task.Status, task.PromptHash, string(progress), task.Result, task.Diff, task.Error, task.OutputExpired, task.CreatedAt.UnixMilli(), task.UpdatedAt.UnixMilli())
 	if err != nil {
 		return fmt.Errorf("create task: %w", err)
 	}
@@ -26,24 +30,24 @@ func (s *Store) CreateTask(ctx context.Context, task domain.Task) error {
 }
 
 func (s *Store) GetTask(ctx context.Context, id string) (domain.Task, error) {
-	return scanTask(s.db.QueryRowContext(ctx, `SELECT id, workspace_id, COALESCE(thread_id,''), turn_id, status, prompt_hash, progress_json, result, diff, error, output_expired, created_at, updated_at FROM tasks WHERE id=?`, id))
+	return scanTask(s.db.QueryRowContext(ctx, `SELECT id, workspace_id, execution_mode, COALESCE(thread_id,''), turn_id, status, prompt_hash, progress_json, result, diff, error, output_expired, created_at, updated_at FROM tasks WHERE id=?`, id))
 }
 
 func scanTask(row *sql.Row) (domain.Task, error) {
 	var task domain.Task
 	var thread, turn sql.NullString
-	var status string
+	var status, mode string
 	var progress string
 	var expired bool
 	var created, updated int64
-	err := row.Scan(&task.ID, &task.WorkspaceID, &thread, &turn, &status, &task.PromptHash, &progress, &task.Result, &task.Diff, &task.Error, &expired, &created, &updated)
+	err := row.Scan(&task.ID, &task.WorkspaceID, &mode, &thread, &turn, &status, &task.PromptHash, &progress, &task.Result, &task.Diff, &task.Error, &expired, &created, &updated)
 	if errors.Is(err, sql.ErrNoRows) {
 		return domain.Task{}, domain.ErrNotFound
 	}
 	if err != nil {
 		return domain.Task{}, err
 	}
-	task.ThreadID, task.TurnID = thread.String, turn.String
+	task.ThreadID, task.TurnID, task.ExecutionMode = thread.String, turn.String, domain.ExecutionMode(mode)
 	task.Status, task.OutputExpired = domain.TaskStatus(status), expired
 	if err := json.Unmarshal([]byte(progress), &task.Progress); err != nil {
 		return domain.Task{}, fmt.Errorf("decode stored progress: %w", err)
@@ -53,7 +57,7 @@ func scanTask(row *sql.Row) (domain.Task, error) {
 }
 
 func (s *Store) ListTasksForThread(ctx context.Context, workspaceID, threadID string) ([]domain.Task, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, workspace_id, COALESCE(thread_id,''), turn_id, status, prompt_hash, progress_json, result, diff, error, output_expired, created_at, updated_at FROM tasks WHERE workspace_id=? AND thread_id=? ORDER BY created_at DESC`, workspaceID, threadID)
+	rows, err := s.db.QueryContext(ctx, `SELECT id, workspace_id, execution_mode, COALESCE(thread_id,''), turn_id, status, prompt_hash, progress_json, result, diff, error, output_expired, created_at, updated_at FROM tasks WHERE workspace_id=? AND thread_id=? ORDER BY created_at DESC`, workspaceID, threadID)
 	if err != nil {
 		return nil, err
 	}
@@ -62,16 +66,16 @@ func (s *Store) ListTasksForThread(ctx context.Context, workspaceID, threadID st
 	for rows.Next() {
 		var t domain.Task
 		var thread, turn sql.NullString
-		var status, progress string
+		var status, mode, progress string
 		var expired bool
 		var created, updated int64
-		if err := rows.Scan(&t.ID, &t.WorkspaceID, &thread, &turn, &status, &t.PromptHash, &progress, &t.Result, &t.Diff, &t.Error, &expired, &created, &updated); err != nil {
+		if err := rows.Scan(&t.ID, &t.WorkspaceID, &mode, &thread, &turn, &status, &t.PromptHash, &progress, &t.Result, &t.Diff, &t.Error, &expired, &created, &updated); err != nil {
 			return nil, err
 		}
 		if err := json.Unmarshal([]byte(progress), &t.Progress); err != nil {
 			return nil, err
 		}
-		t.ThreadID, t.TurnID, t.Status, t.OutputExpired = thread.String, turn.String, domain.TaskStatus(status), expired
+		t.ThreadID, t.TurnID, t.Status, t.ExecutionMode, t.OutputExpired = thread.String, turn.String, domain.TaskStatus(status), domain.ExecutionMode(mode), expired
 		t.CreatedAt, t.UpdatedAt = time.UnixMilli(created).UTC(), time.UnixMilli(updated).UTC()
 		tasks = append(tasks, t)
 	}
@@ -96,7 +100,7 @@ func (s *Store) SetTaskStatus(ctx context.Context, id string, next domain.TaskSt
 		return err
 	}
 	defer tx.Rollback()
-	task, err := scanTask(tx.QueryRowContext(ctx, `SELECT id, workspace_id, COALESCE(thread_id,''), turn_id, status, prompt_hash, progress_json, result, diff, error, output_expired, created_at, updated_at FROM tasks WHERE id=?`, id))
+	task, err := scanTask(tx.QueryRowContext(ctx, `SELECT id, workspace_id, execution_mode, COALESCE(thread_id,''), turn_id, status, prompt_hash, progress_json, result, diff, error, output_expired, created_at, updated_at FROM tasks WHERE id=?`, id))
 	if err != nil {
 		return err
 	}
@@ -122,7 +126,7 @@ func (s *Store) FinishTask(ctx context.Context, id string, status domain.TaskSta
 		return err
 	}
 	defer tx.Rollback()
-	task, err := scanTask(tx.QueryRowContext(ctx, `SELECT id, workspace_id, COALESCE(thread_id,''), turn_id, status, prompt_hash, progress_json, result, diff, error, output_expired, created_at, updated_at FROM tasks WHERE id=?`, id))
+	task, err := scanTask(tx.QueryRowContext(ctx, `SELECT id, workspace_id, execution_mode, COALESCE(thread_id,''), turn_id, status, prompt_hash, progress_json, result, diff, error, output_expired, created_at, updated_at FROM tasks WHERE id=?`, id))
 	if err != nil {
 		return err
 	}
@@ -145,7 +149,7 @@ func (s *Store) AppendProgress(ctx context.Context, id, text string, at time.Tim
 		return err
 	}
 	defer tx.Rollback()
-	task, err := scanTask(tx.QueryRowContext(ctx, `SELECT id, workspace_id, COALESCE(thread_id,''), turn_id, status, prompt_hash, progress_json, result, diff, error, output_expired, created_at, updated_at FROM tasks WHERE id=?`, id))
+	task, err := scanTask(tx.QueryRowContext(ctx, `SELECT id, workspace_id, execution_mode, COALESCE(thread_id,''), turn_id, status, prompt_hash, progress_json, result, diff, error, output_expired, created_at, updated_at FROM tasks WHERE id=?`, id))
 	if err != nil {
 		return err
 	}
@@ -174,7 +178,7 @@ func (s *Store) AppendProgress(ctx context.Context, id, text string, at time.Tim
 }
 
 func (s *Store) RecoverTasks(ctx context.Context) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE tasks SET status='interrupted', error='Bridge restarted while task was active', updated_at=? WHERE status IN ('queued','running','waiting_approval')`, time.Now().UnixMilli())
+	_, err := s.db.ExecContext(ctx, `UPDATE tasks SET status='interrupted', error='Bridge restarted while task was active', updated_at=? WHERE status IN ('queued','running')`, time.Now().UnixMilli())
 	if err != nil {
 		return err
 	}

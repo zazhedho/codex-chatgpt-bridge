@@ -24,3 +24,10 @@ func TestTaskCancellationIsTerminal(t *testing.T) {
 		t.Fatal("cancelled task transitioned to succeeded")
 	}
 }
+
+func TestApprovedWriteTaskCanEnterQueue(t *testing.T) {
+	task := Task{Status: TaskWaitingApproval}
+	if err := task.Transition(TaskQueued); err != nil {
+		t.Fatalf("approved task could not enter queue: %v", err)
+	}
+}

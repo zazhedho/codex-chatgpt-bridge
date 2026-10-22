@@ -1,4 +1,4 @@
-module example.com/codex-chatgpt-bridge
+module github.com/zazhedho/codex-chatgpt-bridge
 
 go 1.27.0
 

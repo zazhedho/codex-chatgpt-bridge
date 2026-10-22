@@ -2,8 +2,10 @@ package security
 
 import (
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -127,4 +129,148 @@ func hasTraversal(value string) bool {
 func pathWithin(root, target string) bool {
 	relative, err := filepath.Rel(root, target)
 	return err == nil && (relative == "." || (relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)) && !filepath.IsAbs(relative)))
+}
+
+func PathWithin(root, target string) bool { return pathWithin(root, target) }
+
+// FindGitProjectRoot returns the nearest repository marker without following .git pointers.
+func FindGitProjectRoot(trustedRoot, sessionPath string) (string, bool, error) {
+	root, err := canonicalExistingDirectory(trustedRoot)
+	if err != nil {
+		return "", false, err
+	}
+	current, err := canonicalExistingDirectory(sessionPath)
+	if err != nil || !pathWithin(root, current) {
+		return "", false, errors.New("session path is outside the trusted root")
+	}
+	for {
+		found, err := hasGitRepositoryMarker(current)
+		if err != nil {
+			return "", false, err
+		}
+		if found {
+			return current, true, nil
+		}
+		if current == root {
+			return "", false, nil
+		}
+		parent := filepath.Dir(current)
+		if parent == current || !pathWithin(root, parent) {
+			return "", false, nil
+		}
+		current = parent
+	}
+}
+
+// FindGitProjectRoots returns Git boundaries below a trusted parent; it never follows symlinks.
+func FindGitProjectRoots(trustedRoot string) ([]string, error) {
+	root, err := canonicalExistingDirectory(trustedRoot)
+	if err != nil {
+		return nil, err
+	}
+	const maxDirectories, maxProjects = 25000, 500
+	visited := 0
+	projects := make([]string, 0)
+	err = filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if !entry.IsDir() {
+			return nil
+		}
+		visited++
+		if visited > maxDirectories {
+			return errors.New("trusted root contains too many directories to enumerate safely")
+		}
+		if entry.Name() == ".git" {
+			return filepath.SkipDir
+		}
+		if path == root {
+			return nil
+		}
+		found, err := hasGitRepositoryMarker(path)
+		if err != nil {
+			return err
+		}
+		if !found {
+			return nil
+		}
+		canonical, err := canonicalExistingDirectory(path)
+		if err != nil || !pathWithin(root, canonical) {
+			return errors.New("repository boundary changed during enumeration")
+		}
+		projects = append(projects, canonical)
+		if len(projects) > maxProjects {
+			return errors.New("trusted root contains too many repositories to enumerate safely")
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(projects, func(i, j int) bool {
+		return filepath.Clean(projects[i]) < filepath.Clean(projects[j])
+	})
+	return projects, nil
+}
+
+func IsGitProjectRoot(path string) (bool, error) {
+	canonical, err := canonicalExistingDirectory(path)
+	if err != nil || canonical != path {
+		return false, errors.New("project path is not canonical")
+	}
+	return hasGitRepositoryMarker(canonical)
+}
+
+func hasGitRepositoryMarker(directory string) (bool, error) {
+	marker := filepath.Join(directory, ".git")
+	info, err := os.Lstat(marker)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return false, nil
+	}
+	if info.IsDir() {
+		return true, nil
+	}
+	if !info.Mode().IsRegular() {
+		return false, nil
+	}
+	file, err := os.Open(marker)
+	if err != nil {
+		return false, err
+	}
+	data, readErr := io.ReadAll(io.LimitReader(file, 4097))
+	closeErr := file.Close()
+	if readErr != nil {
+		return false, readErr
+	}
+	if closeErr != nil {
+		return false, closeErr
+	}
+	value := strings.TrimSpace(string(data))
+	return len(data) <= 4096 && !strings.ContainsRune(value, 0) && strings.HasPrefix(value, "gitdir:") && strings.TrimSpace(strings.TrimPrefix(value, "gitdir:")) != "", nil
+}
+
+func canonicalExistingDirectory(path string) (string, error) {
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path || hasTraversal(path) {
+		return "", errors.New("path must be absolute and canonical")
+	}
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return "", errors.New("path is unavailable")
+	}
+	resolved, err = filepath.Abs(resolved)
+	if err != nil {
+		return "", errors.New("path is invalid")
+	}
+	info, err := os.Stat(resolved)
+	if err != nil || !info.IsDir() {
+		return "", errors.New("path must be a directory")
+	}
+	return resolved, nil
 }

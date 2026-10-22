@@ -3,15 +3,16 @@ package worker
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"sync"
 	"time"
 
-	"example.com/codex-chatgpt-bridge/internal/audit"
-	"example.com/codex-chatgpt-bridge/internal/codex"
-	"example.com/codex-chatgpt-bridge/internal/domain"
-	"example.com/codex-chatgpt-bridge/internal/security"
-	"example.com/codex-chatgpt-bridge/internal/service"
+	"github.com/zazhedho/codex-chatgpt-bridge/internal/audit"
+	"github.com/zazhedho/codex-chatgpt-bridge/internal/codex"
+	"github.com/zazhedho/codex-chatgpt-bridge/internal/domain"
+	"github.com/zazhedho/codex-chatgpt-bridge/internal/security"
+	"github.com/zazhedho/codex-chatgpt-bridge/internal/service"
 )
 
 type Repository interface {
@@ -20,10 +21,17 @@ type Repository interface {
 	AppendProgress(context.Context, string, string, time.Time) error
 	SetTaskThread(context.Context, string, string, string) error
 	GetTask(context.Context, string) (domain.Task, error)
+	ClaimApprovedWriteTask(context.Context, time.Time) (domain.ApprovedWriteTask, error)
+	CancelWriteTask(context.Context, string) error
 }
 
 type Threads interface {
 	SaveThread(context.Context, domain.Thread) error
+	GetThread(context.Context, string) (domain.Thread, error)
+}
+
+type TrustedThreadValidator interface {
+	ValidateThread(context.Context, domain.Thread, domain.Workspace) error
 }
 
 type activeTask struct {
@@ -33,22 +41,26 @@ type activeTask struct {
 }
 
 type Manager struct {
-	mu            sync.Mutex
-	queue         []service.ExecutionJob
-	active        map[string]*activeTask
-	maxConcurrent int
-	maxQueued     int
-	timeout       time.Duration
-	maxOutput     int
-	stopping      bool
-	repo          Repository
-	threads       Threads
-	gateway       codex.Gateway
-	audit         *audit.Logger
-	logger        *slog.Logger
+	mu             sync.Mutex
+	queue          []service.ExecutionJob
+	active         map[string]*activeTask
+	maxConcurrent  int
+	maxQueued      int
+	timeout        time.Duration
+	maxOutput      int
+	stopping       bool
+	pollCancel     context.CancelFunc
+	pollDone       chan struct{}
+	repo           Repository
+	threads        Threads
+	workspaces     *service.WorkspaceService
+	trustedThreads TrustedThreadValidator
+	gateway        codex.Gateway
+	audit          *audit.Logger
+	logger         *slog.Logger
 }
 
-func New(repo Repository, threads Threads, gateway codex.Gateway, auditLogger *audit.Logger, logger *slog.Logger, maxConcurrent, maxQueued, timeoutSeconds, maxOutput int) *Manager {
+func New(repo Repository, threads Threads, workspaces *service.WorkspaceService, gateway codex.Gateway, auditLogger *audit.Logger, logger *slog.Logger, maxConcurrent, maxQueued, timeoutSeconds, maxOutput int, validators ...TrustedThreadValidator) *Manager {
 	if maxConcurrent < 1 {
 		maxConcurrent = 1
 	}
@@ -64,12 +76,35 @@ func New(repo Repository, threads Threads, gateway codex.Gateway, auditLogger *a
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Manager{repo: repo, threads: threads, gateway: gateway, audit: auditLogger, logger: logger, maxConcurrent: maxConcurrent, maxQueued: maxQueued, timeout: time.Duration(timeoutSeconds) * time.Second, maxOutput: maxOutput, active: make(map[string]*activeTask)}
+	var trustedThreads TrustedThreadValidator
+	if len(validators) != 0 {
+		trustedThreads = validators[0]
+	}
+	return &Manager{repo: repo, threads: threads, workspaces: workspaces, trustedThreads: trustedThreads, gateway: gateway, audit: auditLogger, logger: logger, maxConcurrent: maxConcurrent, maxQueued: maxQueued, timeout: time.Duration(timeoutSeconds) * time.Second, maxOutput: maxOutput, active: make(map[string]*activeTask)}
+}
+
+func (m *Manager) Start() {
+	m.mu.Lock()
+	if m.stopping || m.pollDone != nil {
+		m.mu.Unlock()
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	m.pollCancel, m.pollDone = cancel, done
+	m.mu.Unlock()
+	go m.pollApprovedWrites(ctx, done)
 }
 
 func (m *Manager) Submit(ctx context.Context, job service.ExecutionJob) error {
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	if job.ExecutionMode == "" {
+		job.ExecutionMode = domain.ExecutionReadOnly
+	}
+	if job.ExecutionMode != domain.ExecutionReadOnly {
+		return domain.ErrNotAuthorized
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -96,7 +131,7 @@ func (m *Manager) Cancel(ctx context.Context, id string) error {
 	active := m.active[id]
 	if active == nil {
 		m.mu.Unlock()
-		return domain.ErrConflict
+		return m.repo.CancelWriteTask(ctx, id)
 	}
 	if active.reason == "" {
 		active.reason = "cancelled"
@@ -117,6 +152,10 @@ func (m *Manager) Cancel(ctx context.Context, id string) error {
 func (m *Manager) Shutdown(ctx context.Context) error {
 	m.mu.Lock()
 	m.stopping = true
+	if m.pollCancel != nil {
+		m.pollCancel()
+	}
+	pollDone := m.pollDone
 	queued := m.queue
 	m.queue = nil
 	active := make([]*activeTask, 0, len(m.active))
@@ -128,6 +167,13 @@ func (m *Manager) Shutdown(ctx context.Context) error {
 		task.cancel()
 	}
 	m.mu.Unlock()
+	if pollDone != nil {
+		select {
+		case <-pollDone:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 	for _, job := range queued {
 		_ = m.repo.SetTaskStatus(context.Background(), job.TaskID, domain.TaskInterrupted, "Bridge stopped before execution")
 	}
@@ -139,6 +185,43 @@ func (m *Manager) Shutdown(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+func (m *Manager) pollApprovedWrites(ctx context.Context, done chan<- struct{}) {
+	defer close(done)
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		m.claimApprovedWrite(ctx)
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+func (m *Manager) claimApprovedWrite(ctx context.Context) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.stopping || len(m.queue) >= m.maxQueued {
+		return
+	}
+	approved, err := m.repo.ClaimApprovedWriteTask(ctx, time.Now().UTC())
+	if err != nil {
+		if !errors.Is(err, domain.ErrNotFound) && ctx.Err() == nil {
+			m.logger.Warn("approved write task claim failed", "error_class", fmt.Sprintf("%T", err))
+		}
+		return
+	}
+	workspace, err := m.workspaces.GetLocal(ctx, approved.Workspace.ID)
+	if err != nil || !workspace.WriteEnabled || m.workspaces.ValidateWriteScope(ctx, workspace) != nil {
+		_ = m.repo.SetTaskStatus(context.Background(), approved.TaskID, domain.TaskFailed, "Approved workspace is no longer authorized for writes")
+		m.logger.Warn("approved write task rejected after workspace revalidation", "task_id", approved.TaskID)
+		return
+	}
+	m.queue = append(m.queue, service.ExecutionJob{TaskID: approved.TaskID, Workspace: workspace, Prompt: approved.Prompt, ThreadID: approved.ThreadID, ExecutionMode: domain.ExecutionWorkspaceWrite})
+	m.pumpLocked()
 }
 
 func (m *Manager) Stats() (active, queued int) {
@@ -167,6 +250,57 @@ func (m *Manager) execute(ctx context.Context, job service.ExecutionJob, active 
 		m.pumpLocked()
 		m.mu.Unlock()
 	}()
+	if job.ExecutionMode == domain.ExecutionWorkspaceWrite {
+		workspace, err := m.workspaces.GetLocal(ctx, job.Workspace.ID)
+		if err != nil || !workspace.WriteEnabled || m.workspaces.ValidateWriteScope(ctx, workspace) != nil {
+			_ = m.repo.SetTaskStatus(context.Background(), job.TaskID, domain.TaskFailed, "Workspace write permission changed before execution")
+			return
+		}
+		job.Workspace = workspace
+	}
+	if job.ThreadID != "" {
+		thread, err := m.threads.GetThread(ctx, job.ThreadID)
+		if err != nil || thread.WorkspaceID != job.Workspace.ID {
+			_ = m.repo.SetTaskStatus(context.Background(), job.TaskID, domain.TaskFailed, "Thread authorization could not be revalidated")
+			return
+		}
+		workspace, err := m.workspaces.GetLocal(ctx, job.Workspace.ID)
+		if err != nil {
+			_ = m.repo.SetTaskStatus(context.Background(), job.TaskID, domain.TaskFailed, "Workspace authorization could not be revalidated")
+			return
+		}
+		switch thread.Source {
+		case domain.ThreadSourceBridge:
+			if thread.SessionPath != "" && thread.SessionPath != workspace.RootPath {
+				_ = m.repo.SetTaskStatus(context.Background(), job.TaskID, domain.TaskFailed, "Bridge thread workspace changed before execution")
+				return
+			}
+		case domain.ThreadSourceCodexCLI:
+			if thread.SessionPath != workspace.RootPath {
+				_ = m.repo.SetTaskStatus(context.Background(), job.TaskID, domain.TaskFailed, "Attached session workspace changed before execution")
+				return
+			}
+		case domain.ThreadSourceCodexCLITrusted:
+			if !workspace.SessionTrusted || thread.SessionPath != workspace.RootPath {
+				_ = m.repo.SetTaskStatus(context.Background(), job.TaskID, domain.TaskFailed, "Trusted workspace session access was revoked before execution")
+				return
+			}
+		case domain.ThreadSourceCodexCLIRoot:
+			if m.trustedThreads == nil || m.trustedThreads.ValidateThread(ctx, thread, workspace) != nil {
+				_ = m.repo.SetTaskStatus(context.Background(), job.TaskID, domain.TaskFailed, "Trusted root session access was revoked or changed before execution")
+				return
+			}
+		case domain.ThreadSourceCodexCLIProjectBound:
+			if m.trustedThreads == nil || m.trustedThreads.ValidateThread(ctx, thread, workspace) != nil {
+				_ = m.repo.SetTaskStatus(context.Background(), job.TaskID, domain.TaskFailed, "Project-bound session access was revoked, became active, or changed before execution")
+				return
+			}
+		default:
+			_ = m.repo.SetTaskStatus(context.Background(), job.TaskID, domain.TaskFailed, "Thread source is not authorized for Bridge execution")
+			return
+		}
+		job.Workspace = workspace
+	}
 	if err := m.repo.SetTaskStatus(context.Background(), job.TaskID, domain.TaskRunning, ""); err != nil {
 		m.logger.Error("failed to mark task running", "task_id", job.TaskID)
 		return
@@ -175,14 +309,14 @@ func (m *Manager) execute(ctx context.Context, job service.ExecutionJob, active 
 		_ = m.audit.Record(context.Background(), audit.Event{Operation: "task.started", Principal: "worker", WorkspaceID: job.Workspace.ID, TaskID: job.TaskID, Outcome: "success"})
 	}
 	result, err := m.gateway.Run(ctx, codex.TaskRequest{
-		TaskID: job.TaskID, Workspace: job.Workspace, Prompt: job.Prompt, ThreadID: job.ThreadID,
+		TaskID: job.TaskID, Workspace: job.Workspace, Prompt: job.Prompt, ThreadID: job.ThreadID, ExecutionMode: job.ExecutionMode,
 		OnProgress: func(text string) {
 			if saveErr := m.repo.AppendProgress(context.Background(), job.TaskID, security.RedactSecrets(text), time.Now().UTC()); saveErr != nil {
 				m.logger.Warn("could not persist task progress", "task_id", job.TaskID)
 			}
 		},
 		OnThread: func(threadID, turnID string) error {
-			if err := m.threads.SaveThread(context.Background(), domain.Thread{ID: threadID, WorkspaceID: job.Workspace.ID, CreatedAt: time.Now().UTC()}); err != nil {
+			if err := m.threads.SaveThread(context.Background(), domain.Thread{ID: threadID, WorkspaceID: job.Workspace.ID, Source: domain.ThreadSourceBridge, SessionPath: job.Workspace.RootPath, CreatedAt: time.Now().UTC()}); err != nil {
 				return err
 			}
 			return m.repo.SetTaskThread(context.Background(), job.TaskID, threadID, turnID)

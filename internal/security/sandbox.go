@@ -1,5 +1,10 @@
 package security
 
+import (
+	"errors"
+	"path/filepath"
+)
+
 type CodexPermission struct {
 	Extends        string          `json:"extends"`
 	WorkspaceRoots map[string]bool `json:"workspace_roots"`
@@ -7,21 +12,44 @@ type CodexPermission struct {
 	Network        map[string]bool `json:"network"`
 }
 
-type ReadOnlyProfile struct {
+type PermissionProfile struct {
 	DefaultPermissions string
 	WorkspaceRoots     map[string]bool
 	Filesystem         map[string]any
 	MCPServers         map[string]any
 	WebSearch          string
 	NetworkEnabled     bool
+	WorkspaceWrite     map[string]any
+	parent             string
 }
 
-func CodexReadOnlyProfile(workspaceRoot string) ReadOnlyProfile {
+func CodexReadOnlyProfile(workspaceRoot string) PermissionProfile {
+	return codexProfile(workspaceRoot, "bridge-readonly", ":read-only", "read", nil)
+}
+
+func CodexWorkspaceWriteProfile(workspaceRoot, codexExecutable string) (PermissionProfile, error) {
+	if !filepath.IsAbs(workspaceRoot) || !filepath.IsAbs(codexExecutable) {
+		return PermissionProfile{}, errors.New("workspace and Codex executable paths must be absolute")
+	}
+	profile := codexProfile(workspaceRoot, "bridge-workspace-write", ":workspace", "write", nil)
+	roots := profile.Filesystem[":workspace_roots"].(map[string]any)
+	roots[".git"] = "read"
+	roots[".git/**"] = "read"
+	roots[".codex"] = "read"
+	roots[".codex/**"] = "read"
+	profile.Filesystem[":tmpdir"] = "deny"
+	profile.Filesystem[":slash_tmp"] = "deny"
+	// Codex starts its own local sandbox helper using this executable.
+	profile.Filesystem[filepath.Clean(codexExecutable)] = "read"
+	return profile, nil
+}
+
+func codexProfile(workspaceRoot, id, parent, workspaceAccess string, writeConfig map[string]any) PermissionProfile {
 	filesystem := map[string]any{
 		":root":    "deny",
 		":minimal": "read",
 		":workspace_roots": map[string]any{
-			".":                     "read",
+			".":                     workspaceAccess,
 			"**/.env":               "deny",
 			"**/.env.*":             "deny",
 			"**/*.env":              "deny",
@@ -42,22 +70,24 @@ func CodexReadOnlyProfile(workspaceRoot string) ReadOnlyProfile {
 			".git-credentials":      "deny",
 		},
 	}
-	return ReadOnlyProfile{
-		DefaultPermissions: "bridge-readonly",
+	return PermissionProfile{
+		DefaultPermissions: id,
 		WorkspaceRoots:     map[string]bool{workspaceRoot: true},
 		Filesystem:         filesystem,
 		MCPServers:         map[string]any{},
 		WebSearch:          "disabled",
 		NetworkEnabled:     false,
+		WorkspaceWrite:     writeConfig,
+		parent:             parent,
 	}
 }
 
-func (p ReadOnlyProfile) AppServerConfig() map[string]any {
-	return map[string]any{
+func (p PermissionProfile) AppServerConfig() map[string]any {
+	config := map[string]any{
 		"default_permissions": p.DefaultPermissions,
 		"permissions": map[string]any{
 			p.DefaultPermissions: CodexPermission{
-				Extends:        ":read-only",
+				Extends:        p.parent,
 				WorkspaceRoots: p.WorkspaceRoots,
 				Filesystem:     p.Filesystem,
 				Network:        map[string]bool{"enabled": p.NetworkEnabled},
@@ -66,4 +96,8 @@ func (p ReadOnlyProfile) AppServerConfig() map[string]any {
 		"mcp_servers": p.MCPServers,
 		"web_search":  p.WebSearch,
 	}
+	if p.WorkspaceWrite != nil {
+		config["sandbox_workspace_write"] = p.WorkspaceWrite
+	}
+	return config
 }
